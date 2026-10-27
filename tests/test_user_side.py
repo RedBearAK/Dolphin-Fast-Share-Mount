@@ -953,7 +953,7 @@ class PasswordStoreTests(unittest.TestCase):
 
     def test_missing_entry_is_no_password(self):
         # kwallet-query's error message must never be taken for a password
-        self.assertIsNone(self.store(FakeKWallet()).get("kkf@photos.example.net"))
+        self.assertIsNone(self.store(FakeKWallet()).get("jordan@photos.example.net"))
 
     def test_saved_password_is_read(self):
         store = self.store(FakeKWallet({"jordan@nas": "s3cret, with=comma"}))
