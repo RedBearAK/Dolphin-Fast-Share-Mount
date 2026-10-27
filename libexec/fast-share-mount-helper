@@ -16,7 +16,7 @@
 # Usage:
 #   fast-share-mount-helper mount --uid UID --host HOST --share SHARE
 #           [--user USER] [--domain DOMAIN] [--port PORT] [--vers VERSION]
-#           [--guest] [--label NAME]
+#           [--guest] [--folder NAME] [--sidebar TEXT]
 #   fast-share-mount-helper unmount --uid UID --path MOUNTPOINT [--lazy]
 #   fast-share-mount-helper unmount-all --uid UID [--lazy]
 #   fast-share-mount-helper unmount-all --every-user [--lazy]
@@ -128,11 +128,12 @@ is_valid_vers() {
     esac
 }
 
-# Folder name for a host or share: characters outside [A-Za-z0-9._-] become
-# "_", a leading "." becomes "_", at most 100 bytes.
+# Folder name for a host or share: characters outside [A-Za-z0-9._@+-]
+# become "_" (none of these needs quoting in a shell), a leading "." becomes
+# "_", at most 100 bytes.
 safe_name() {
     local name=$1
-    name=${name//[^A-Za-z0-9._-]/_}
+    name=${name//[^A-Za-z0-9._@+-]/_}
     if [[ $name == .* ]]; then
         name=_${name:1}
     fi
@@ -140,12 +141,19 @@ safe_name() {
     printf '%s' "${name:-_}"
 }
 
-# A server's display name (as Dolphin's network view shows it), at most 64
-# bytes of printable text without "/".
-is_valid_label() {
-    local label=$1
+# A folder name asked for by the caller: printable text without "/", at
+# most 200 bytes (safe_name then makes it a folder name of at most 100).
+is_valid_folder_request() {
+    local name=$1
     local LC_ALL=C
-    [[ -n $label && ${#label} -le 64 && $label != */* && $label != *[[:cntrl:]]* ]]
+    [[ -n $name && ${#name} -le 200 && $name != */* && $name != *[[:cntrl:]]* ]]
+}
+
+# The name for Dolphin's sidebar: printable text, at most 256 bytes.
+is_valid_sidebar_text() {
+    local text=$1
+    local LC_ALL=C
+    [[ -n $text && ${#text} -le 256 && $text != *[[:cntrl:]]* ]]
 }
 
 # Percent-encode every byte outside [A-Za-z0-9._~-], for an x-gvfs-name
@@ -520,10 +528,10 @@ probe_readable() {
 # ---- commands ------------------------------------------------------------------
 
 cmd_mount() {
-    local uid="" host="" share="" user="" domain="" port="" vers="" guest="" label=""
+    local uid="" host="" share="" user="" domain="" port="" vers="" guest="" folder="" sidebar=""
     while (( $# )); do
         case $1 in
-            --uid|--host|--share|--user|--domain|--port|--vers|--label)
+            --uid|--host|--share|--user|--domain|--port|--vers|--folder|--sidebar)
                 (( $# >= 2 )) || fail EUSAGE "Missing value for $1"
                 case $1 in
                     --uid) uid=$2 ;;
@@ -533,7 +541,8 @@ cmd_mount() {
                     --domain) domain=$2 ;;
                     --port) port=$2 ;;
                     --vers) vers=$2 ;;
-                    --label) label=$2 ;;
+                    --folder) folder=$2 ;;
+                    --sidebar) sidebar=$2 ;;
                 esac
                 shift 2
                 ;;
@@ -553,7 +562,8 @@ cmd_mount() {
     [[ -z $domain ]] || is_valid_domain "$domain" || fail EINVALID "Invalid domain" "$domain"
     [[ -z $port ]] || is_valid_port "$port" || fail EINVALID "Invalid port" "$port"
     [[ -z $vers ]] || is_valid_vers "$vers" || fail EINVALID "Invalid SMB version" "$vers"
-    [[ -z $label ]] || is_valid_label "$label" || fail EINVALID "Invalid server display name" "$label"
+    [[ -z $folder ]] || is_valid_folder_request "$folder" || fail EINVALID "Invalid folder name" "$folder"
+    [[ -z $sidebar ]] || is_valid_sidebar_text "$sidebar" || fail EINVALID "Invalid sidebar name" "$sidebar"
     command -v mount.cifs >/dev/null || fail EMISSING "mount.cifs is missing (package cifs-utils)"
     command -v mount >/dev/null || fail EMISSING "mount is missing (package util-linux)"
 
@@ -579,10 +589,10 @@ cmd_mount() {
             return 0
         fi
     done < <(cifs_mounts_under "$MOUNTINFO" "$host_dir")
-    # The folder (and the name in Dolphin's sidebar) is "Server-Share" when
-    # the caller gives the server's display name, else the share name.
-    local name=$share
-    [[ -z $label ]] || name="$label-$share"
+    # The folder is the name the caller asks for (such as "Backups@Photos"),
+    # else the share's, made safe here; the sidebar shows the caller's text,
+    # else the folder's name.
+    local name=${folder:-$share}
     for suffix in "" "~2" "~3" "~4" "~5" "~6" "~7" "~8" "~9"; do
         candidate="$host_dir/$(safe_name "$name")$suffix"
         if mount_entry_at "$MOUNTINFO" "$candidate"; then
@@ -615,7 +625,7 @@ cmd_mount() {
     [[ -z $vers ]] || options+=",vers=$vers"
     # Solid shows these in Dolphin's sidebar; mount(8) keeps them in
     # /run/mount/utab (the kernel never sees x- options).
-    options+=",x-gvfs-name=$(percent_encode "$name"),x-gvfs-icon=folder-remote"
+    options+=",x-gvfs-name=$(percent_encode "${sidebar:-${mountpoint##*/}}"),x-gvfs-icon=folder-remote"
 
     log info "mounting $source at $mountpoint (options: $options)"
     local started err="" status=0 kernel
@@ -694,7 +704,7 @@ is_tool_mountpoint_path() {
     [[ $rest == */* && $rest != */*/* ]] || return 1
     host_part=${rest%%/*}
     share_part=${rest#*/}
-    [[ $host_part =~ ^[A-Za-z0-9._-]+$ && $share_part =~ ^[A-Za-z0-9._~-]+$ ]] || return 1
+    [[ $host_part =~ ^[A-Za-z0-9._-]+$ && $share_part =~ ^[A-Za-z0-9._@+~-]+$ ]] || return 1
     [[ $host_part != . && $host_part != .. && $share_part != . && $share_part != .. ]] || return 1
 }
 

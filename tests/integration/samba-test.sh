@@ -140,11 +140,13 @@ check "share refused after a good login" "19||EDENIED" "$(helper "$TEST_PASSWORD
 check "mount" "0|OK|" "$(helper "$TEST_PASSWORD" mount "${common[@]}" --share Shared --user "$TEST_USER")"
 require_mount "$BASE/127.0.0.1/Shared"
 check "mount again is ALREADY" "0|ALREADY|" "$(helper "$TEST_PASSWORD" mount "${common[@]}" --share shared --user "$TEST_USER")"
-check "guest mount with a display name" "0|OK|" \
-    "$(helper "" mount "${common[@]}" --share Public --guest --label "Test Box")"
-require_mount "$BASE/127.0.0.1/Test_Box-Public"
-check "sidebar name and icon recorded by mount(8)" "x-gvfs-name=Test%20Box-Public x-gvfs-icon=folder-remote" \
-    "$(grep -F "TARGET=$BASE/127.0.0.1/Test_Box-Public " /run/mount/utab 2>/dev/null \
+check "guest mount with folder and sidebar names" "0|OK|" \
+    "$(helper "" mount "${common[@]}" --share Public --guest --folder "Public@Test Box" \
+        --sidebar "Public [Test Box]")"
+require_mount "$BASE/127.0.0.1/Public@Test_Box"
+check "sidebar name and icon recorded by mount(8)" \
+    "x-gvfs-name=Public%20%5BTest%20Box%5D x-gvfs-icon=folder-remote" \
+    "$(grep -F "TARGET=$BASE/127.0.0.1/Public@Test_Box " /run/mount/utab 2>/dev/null \
         | grep -o 'x-gvfs-[a-z]*=[^, ]*' | tr '\n' ' ' | sed 's/ $//')"
 
 mountpoint="$BASE/127.0.0.1/Shared"

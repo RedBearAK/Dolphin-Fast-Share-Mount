@@ -79,6 +79,8 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config["user"], "jordan")
         self.assertEqual(config["open_mode"], "window")
         self.assertEqual(config["remember_password"], "ask")
+        self.assertEqual(config["folder_name"], "{share}@{server}")
+        self.assertEqual(config["sidebar_name"], "folder_name")
         self.assertEqual(warnings, [])
 
     def test_problems_are_reported(self):
@@ -846,6 +848,47 @@ class OpenFoldersTests(unittest.TestCase):
         self.popen.assert_not_called()
 
 
+class NameSettingTests(unittest.TestCase):
+    def parse(self, line):
+        return fsm.parse_config(line + "\n")
+
+    def test_folder_name_templates_and_aliases(self):
+        for value, expected in (("{share}@{server}", "{share}@{server}"), ("share", "{share}"),
+                                ("server-share", "{server}-{share}"), ("{share}+{server}", "{share}+{server}"),
+                                ("{server}_{share}", "{server}_{share}")):
+            config, warnings = self.parse(f"folder_name={value}")
+            self.assertEqual((config["folder_name"], warnings), (expected, []), value)
+
+    def test_bad_folder_names_are_refused_with_a_warning(self):
+        for value in ("{server}", "{share} [{server}]", "{share}/{server}", "{share}:{server}",
+                      "{Share}", ""):
+            config, warnings = self.parse(f"folder_name={value}")
+            self.assertEqual(config["folder_name"], "{share}@{server}", value)
+            self.assertEqual(len(warnings), 1, value)
+            self.assertIn("needs {share}", warnings[0])
+
+    def test_sidebar_name_is_folder_name_or_quoted_text(self):
+        for value, expected in (("folder_name", "folder_name"), ('"{share} [{server}]"', '"{share} [{server}]"'),
+                                ("'{share} on {server}'", '"{share} on {server}"')):
+            config, warnings = self.parse(f"sidebar_name={value}")
+            self.assertEqual((config["sidebar_name"], warnings), (expected, []), value)
+        for value in ("{share} [{server}]", '"unclosed', '""', '"  "', "'mixed\"", "Folder_Name"):
+            config, warnings = self.parse(f"sidebar_name={value}")
+            self.assertEqual(config["sidebar_name"], "folder_name", value)
+            self.assertEqual(len(warnings), 1, value)
+
+    def test_fill_name_is_one_pass(self):
+        self.assertEqual(fsm.fill_name("{share}@{server}", "Media", "{share}"), "Media@{share}")
+        self.assertEqual(fsm.fill_name("{share}@{server}", "{server}", "Nas"), "{server}@Nas")
+
+    def test_middle_ellipsis(self):
+        self.assertEqual(fsm.middle_ellipsis("short"), "short")
+        self.assertEqual(fsm.middle_ellipsis("x" * 40), "x" * 40)
+        cut = fsm.middle_ellipsis("a" * 30 + "b" * 30)
+        self.assertEqual(cut, "a" * 20 + "…" + "b" * 19)
+        self.assertEqual(len(fsm.middle_ellipsis("x" * 41)), 40)
+
+
 class FakeKWallet:
     """kwallet-query and the KWallet D-Bus calls as they behave in KDE
     Frameworks 6 (checked against kwalletd6 on openSUSE, 2026-10-26):
@@ -1113,22 +1156,38 @@ class MountFlowTests(unittest.TestCase):
         self.assertEqual(app.mount_one(fsm.parse_smb_url("smb://nas/Media")), 0)
         fsm.PasswordStore.return_value.put.assert_not_called()
 
-    def test_folder_label_goes_to_the_helper_unless_turned_off(self):
+    def names(self, folder_name=None, sidebar_name=None, announced="Jordan's NAS",
+              url="smb://nas.example.net/Media"):
         app = self.app(FakeUI(passwords=["pw"]), helper_results=[self.ok()])
-        fsm.server_display_name.return_value = "Jordan's NAS"
-        self.assertEqual(app.mount_one(fsm.parse_smb_url("smb://nas/Media")), 0)
+        fsm.server_display_name.return_value = announced
+        if folder_name is not None:
+            app.config["folder_name"] = folder_name
+        if sidebar_name is not None:
+            app.config["sidebar_name"] = sidebar_name
+        self.assertEqual(app.mount_one(fsm.parse_smb_url(url)), 0)
         args = app.elevator.run_helper.call_args.args[1]
-        self.assertEqual(args[args.index("--label") + 1], "Jordan's NAS")
-        app = self.app(FakeUI(passwords=["pw"]), helper_results=[self.ok()])
-        fsm.server_display_name.return_value = None
-        args = (app.mount_one(fsm.parse_smb_url("smb://nas.example.net/Media")),
-                app.elevator.run_helper.call_args.args[1])
-        self.assertEqual(args[1][args[1].index("--label") + 1], "nas")
-        app = self.app(FakeUI(passwords=["pw"]), helper_results=[self.ok()])
-        app.config["folder_name"] = "share"
-        self.assertEqual(app.mount_one(fsm.parse_smb_url("smb://nas/Media")), 0)
-        self.assertNotIn("--label", app.elevator.run_helper.call_args.args[1])
+        pick = lambda option: args[args.index(option) + 1] if option in args else None
+        return pick("--folder"), pick("--sidebar")
+
+    def test_default_is_share_at_server_and_sidebar_follows(self):
+        self.assertEqual(self.names(), ("Media@Jordan's NAS", None))
+        self.assertEqual(self.names(announced=None), ("Media@nas", None))
+
+    def test_other_templates(self):
+        self.assertEqual(self.names("{server}-{share}"), ("Jordan's NAS-Media", None))
+        self.assertEqual(self.names("{share}"), (None, None))
+        fsm.server_display_name.reset_mock()
+        self.assertEqual(self.names("{share}", '"{share} [{server}]"'), (None, "Media [Jordan's NAS]"))
+        self.assertEqual(self.names("{share}", '"just {share}"'), (None, "just Media"))
         fsm.server_display_name.assert_not_called()
+
+    def test_long_sidebar_names_keep_both_ends(self):
+        folder, sidebar = self.names("{share}", '"{share} on {server}"',
+                                     announced="A Very Long Server Name For Testing",
+                                     url="smb://nas/Quarterly_Reports_Archive")
+        self.assertEqual(len(sidebar), 40)
+        self.assertTrue(sidebar.startswith("Quarterly_Reports_Ar") and sidebar.endswith("For Testing"))
+        self.assertEqual(sidebar.count("…"), 1)
 
     def test_port_139_is_tried_when_445_is_closed(self):
         app = self.app(FakeUI(passwords=["pw"]), helper_results=[self.ok()])

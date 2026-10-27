@@ -460,19 +460,31 @@ class MountFlowTests(unittest.TestCase):
         self.assertRegex(since, r"^[0-9]+\.[0-9]{9}$")
         self.assertLessEqual(abs(float(since) - before), 5)
 
-    def test_display_name_makes_the_folder_and_sidebar_name(self):
+    def test_folder_and_sidebar_names_from_the_caller(self):
         result = self.mount("--uid", "1000", "--host", "photos.example.net", "--share", "Backups",
-                            "--user", "jordan", "--label", "Jordan's NAS")
+                            "--user", "jordan", "--folder", "Backups@Jordan's NAS",
+                            "--sidebar", "Backups [Jordan's NAS]")
         self.assertEqual(result.returncode, 0, result.stderr)
-        mountpoint = os.path.join(self.base, "1000", "photos.example.net", "Jordan_s_NAS-Backups")
+        mountpoint = os.path.join(self.base, "1000", "photos.example.net", "Backups@Jordan_s_NAS")
         self.assertEqual(result.stdout, f"OK\t{mountpoint}\t3.1.1\n")
         self.assertEqual(self.read("mount-argv").splitlines()[:2],
                          ["//photos.example.net/Backups", mountpoint])
         options = self.read("argv").splitlines()[3].split(",")
-        self.assertIn("x-gvfs-name=Jordan%27s%20NAS-Backups", options)
+        self.assertIn("x-gvfs-name=Backups%20%5BJordan%27s%20NAS%5D", options)
         self.assertIn("x-gvfs-icon=folder-remote", options)
 
-    def test_without_a_display_name_the_folder_is_the_share(self):
+    def test_sidebar_defaults_to_the_folder_name_with_its_suffix(self):
+        first = self.mount("--uid", "1000", "--host", "nas", "--share", "Media", "--user", "kris",
+                           "--folder", "Media+Nas")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertIn("x-gvfs-name=Media%2BNas", self.read("argv").splitlines()[3].split(","))
+        os.makedirs(os.path.join(self.base, "1000", "nas", "Other+Nas", "taken"))
+        second = self.mount("--uid", "1000", "--host", "nas", "--share", "Other", "--user", "kris",
+                            "--folder", "Other+Nas")
+        self.assertTrue(second.stdout.startswith(f"OK\t{self.base}/1000/nas/Other+Nas~2\t"), second.stderr)
+        self.assertIn("x-gvfs-name=Other%2BNas~2", self.read("argv").splitlines()[3].split(","))
+
+    def test_without_a_folder_name_the_folder_is_the_share(self):
         result = self.mount("--uid", "1000", "--host", "nas", "--share", "Media", "--user", "kris")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(result.stdout.startswith(f"OK\t{self.base}/1000/nas/Media\t"))
@@ -482,22 +494,29 @@ class MountFlowTests(unittest.TestCase):
         first = self.mount("--uid", "1000", "--host", "nas", "--share", "Media", "--user", "kris")
         self.assertEqual(first.returncode, 0, first.stderr)
         again = self.mount("--uid", "1000", "--host", "nas", "--share", "Media", "--user", "kris",
-                           "--label", "Nas")
+                           "--folder", "Media@Nas")
         self.assertEqual(again.stdout, f"ALREADY\t{self.base}/1000/nas/Media\t3.1.1\n")
 
-    def test_invalid_display_names_are_refused(self):
-        for label in ("x" * 65, "a/b", "tab\there", "nl\nhere"):
+    def test_invalid_folder_and_sidebar_names_are_refused(self):
+        bad = [("--folder", "x" * 201), ("--folder", "a/b"), ("--folder", "tab\there"),
+               ("--sidebar", "x" * 257), ("--sidebar", "nl\nhere")]
+        for option, value in bad:
             result = self.mount("--uid", "1000", "--host", "nas", "--share", "Media",
-                                "--user", "kris", "--label", label)
-            self.assertEqual(result.returncode, 3, repr(label))
-            self.assertTrue(result.stderr.startswith("EINVALID\t"), repr(label))
+                                "--user", "kris", option, value)
+            self.assertEqual(result.returncode, 3, (option, value))
+            self.assertTrue(result.stderr.startswith("EINVALID\t"), (option, value))
         ok = self.mount("--uid", "1000", "--host", "nas", "--share", "Media", "--user", "kris",
-                        "--label", "x" * 64)
+                        "--folder", "f" * 200, "--sidebar", "a/b " + "s" * 252)
         self.assertEqual(ok.returncode, 0, ok.stderr)
-        self.assertTrue(ok.stdout.startswith(f"OK\t{self.base}/1000/nas/{'x' * 64}-Media\t"))
-        empty = self.mount("--uid", "1000", "--host", "other", "--share", "Media", "--user", "kris",
-                           "--label", "")
-        self.assertTrue(empty.stdout.startswith(f"OK\t{self.base}/1000/other/Media\t"), empty.stderr)
+        self.assertTrue(ok.stdout.startswith(f"OK\t{self.base}/1000/nas/{'f' * 100}\t"))
+        dots = self.mount("--uid", "1000", "--host", "other", "--share", "Media", "--user", "kris",
+                          "--folder", "..")
+        self.assertTrue(dots.stdout.startswith(f"OK\t{self.base}/1000/other/_.\t"), dots.stderr)
+
+    def test_unmount_accepts_at_and_plus_in_folder_names(self):
+        for name in ("Backups@Photos", "Media+Nas"):
+            self.assertEqual(bash('is_tool_mountpoint_path "$1" 1000 && echo yes',
+                                  f"/run/dolphin-fast-share-mount/1000/nas/{name}").stdout, "yes\n")
 
     def test_success_passes_password_only_through_the_pipe(self):
         secret = " p@ss, word=1 %x\\y "

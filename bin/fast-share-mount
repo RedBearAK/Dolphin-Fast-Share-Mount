@@ -56,14 +56,33 @@ DEFAULT_CONFIG = {
     "smb_version": "",
     "open_mode": "tab",
     "remember_password": "ask",
-    "folder_name": "server-share",
+    "folder_name": "{share}@{server}",
+    "sidebar_name": "folder_name",
 }
 CONFIG_CHOICES = {
     "smb_version": ("",) + SMB_VERSIONS,
     "open_mode": ("tab", "window", "none"),
     "remember_password": ("ask", "always", "never"),
-    "folder_name": ("server-share", "share"),
 }
+FOLDER_NAME_ALIASES = {"server-share": "{server}-{share}", "share": "{share}"}
+SIDEBAR_NAME_LIMIT = 40
+_FOLDER_TEMPLATE = re.compile(r"(?:\{share\}|\{server\}|[A-Za-z0-9._+@-])+")
+_PLACEHOLDER = re.compile(r"\{(share|server)\}")
+
+
+def fill_name(template: str, share: str, server: str) -> str:
+    """TEMPLATE with {share} and {server} replaced (in one pass, so a server
+    called "{share}" stays literal)."""
+    return _PLACEHOLDER.sub(lambda m: share if m.group(1) == "share" else server, template)
+
+
+def middle_ellipsis(text: str, limit: int = SIDEBAR_NAME_LIMIT) -> str:
+    """TEXT, or its start and end around "…" so that it is LIMIT characters."""
+    if len(text) <= limit:
+        return text
+    head = limit // 2
+    tail = limit - 1 - head
+    return text[:head] + "…" + (text[-tail:] if tail else "")
 
 
 class UsageError(Exception):
@@ -233,6 +252,22 @@ def parse_config(text: str) -> tuple:
                 f"keeping '{config[key]}'"
             )
             continue
+        if key == "folder_name":
+            value = FOLDER_NAME_ALIASES.get(value, value)
+            if not _FOLDER_TEMPLATE.fullmatch(value) or "{share}" not in value:
+                warnings.append(
+                    f"line {number}: folder_name '{value}' needs {{share}} and may hold only "
+                    f"{{server}}, letters, digits and . _ - + @; keeping '{config[key]}'")
+                continue
+        if key == "sidebar_name" and value != "folder_name":
+            quoted = len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'"
+            text = value[1:-1] if quoted else ""
+            if not quoted or not text.strip() or not text.isprintable():
+                warnings.append(
+                    f"line {number}: sidebar_name must be folder_name or quoted text such as "
+                    f"\"{{share}} [{{server}}]\"; keeping {config[key]}")
+                continue
+            value = '"' + text + '"'
         if key == "user" and value and not is_valid_user(value):
             warnings.append(f"line {number}: user name '{value}' not supported (ignored)")
             continue
@@ -1236,6 +1271,23 @@ class App:
                 shown.append(path)
         return shown
 
+    def name_arguments(self, ref: ShareRef) -> list:
+        """--folder and --sidebar for the helper, from folder_name and sidebar_name."""
+        folder_template = self.config["folder_name"]
+        sidebar = self.config["sidebar_name"]
+        sidebar_template = None if sidebar == "folder_name" else sidebar[1:-1]
+        server = ""
+        if "{server}" in folder_template + (sidebar_template or ""):
+            server = folder_label(ref.host, server_display_name(ref.host)) or ref.host
+        args = []
+        folder = fill_name(folder_template, ref.share, server)
+        if folder != ref.share:
+            args += ["--folder", folder]
+        if sidebar_template is not None:
+            text = middle_ellipsis(fill_name(sidebar_template, ref.share, server).strip())
+            args += ["--sidebar", "".join(ch for ch in text if ch.isprintable())]
+        return args
+
     def pick_shares(self, root: "ServerRoot") -> tuple:
         """(smb:// addresses of the shares picked on a server, error status)."""
         problem = tcp_probe(root.host, root.port or 445)
@@ -1332,10 +1384,7 @@ class App:
         vers = self.args.vers or self.config["smb_version"]
         if vers:
             args += ["--vers", vers]
-        if self.config["folder_name"] == "server-share":
-            label = folder_label(ref.host, server_display_name(ref.host))
-            if label:
-                args += ["--label", label]
+        args += self.name_arguments(ref)
 
         store = PasswordStore(self.log)
         key = wallet_key(user, ref.host, domain)
