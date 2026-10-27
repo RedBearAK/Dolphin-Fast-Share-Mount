@@ -70,6 +70,14 @@ class UsageError(Exception):
     """A request that cannot be carried out as given (bad URL, bad path...)."""
 
 
+class ServerRoot(UsageError):
+    """An smb:// address that names a server (or workgroup) but no share."""
+
+    def __init__(self, message: str, url: str, host: str, port: int | None):
+        super().__init__(message)
+        self.url, self.host, self.port = url, host, port
+
+
 # ---- validation (mirrors fast-share-mount-helper; the helper is the authority) ----
 
 _HOST_CHARS = re.compile(r"[A-Za-z0-9.-]+")
@@ -163,9 +171,9 @@ def parse_smb_url(url: str) -> ShareRef:
         port = int(port_text)
     segments = [urllib.parse.unquote(s) for s in parts.path.split("/") if s]
     if not segments:
-        raise UsageError(
-            f"smb://{host}/ is a server or workgroup, not a share. Open one of its shares first."
-        )
+        raise ServerRoot(
+            f"smb://{host}/ is a server or workgroup, not a share. Open one of its shares first.",
+            f"smb://{parts.netloc}/", host, port)
     share, subpath = segments[0], tuple(segments[1:])
     if not is_valid_host(host):
         raise UsageError(f"Server name not supported: {host}")
@@ -534,6 +542,26 @@ def folder_label(host: str, announced: str | None) -> str:
     return name
 
 
+def list_shares(url: str) -> tuple:
+    """(share names, failure text or None) of the server at URL, listed through
+    KIO, which uses the logins Dolphin has saved (and asks when it has none).
+    Hidden shares ($) and names the tool cannot mount are left out."""
+    tool = next((t for t in ("kioclient6", "kioclient", "kioclient5") if which(t)), None)
+    if tool is None:
+        return [], "kioclient (KIO) is needed to list the shares; open a share first instead"
+    result = run([tool, "ls", url], timeout=120)
+    if result.returncode != 0:
+        return [], (result.stderr.strip() or f"{tool} ls failed").splitlines()[-1]
+    shares = []
+    for line in result.stdout.splitlines():
+        name = line.strip()
+        if name in ("", ".", "..") or name.endswith("$") or not is_valid_share(name):
+            continue
+        if name not in shares:
+            shares.append(name)
+    return sorted(shares, key=str.lower), None
+
+
 def tcp_probe(host: str, port: int, timeout: float = PROBE_TIMEOUT) -> str | None:
     """None when host:port accepts a TCP connection, else the reason."""
     try:
@@ -679,7 +707,7 @@ class UI:
                        timeout=3600).returncode == 0
         return False
 
-    def choose_many(self, text: str, items: list) -> list | None:
+    def choose_many(self, text: str, items: list, verb: str = "unmount") -> list | None:
         """Indexes of the ITEMS ((label, ticked) pairs) the user picks, or None
         when cancelled. UsageError when there is no way to ask."""
         if not self.gui:
@@ -690,7 +718,7 @@ class UI:
             for number, (label, ticked) in enumerate(items, 1):
                 print(f"  {number}{'*' if ticked else ' '} {label}")
             try:
-                answer = input("Numbers to unmount (Enter for the ones marked *, 'all' for all): ")
+                answer = input(f"Numbers to {verb} (Enter for the ones marked *, 'all' for all): ")
             except (EOFError, KeyboardInterrupt):
                 return None
             answer = answer.strip().lower()
@@ -1112,23 +1140,33 @@ class App:
         return helper
 
     def open_folder(self, path: str) -> None:
+        """Open PATH now, or at the end of a mount command (see cmd_mount)."""
+        if getattr(self, "to_open", None) is not None:
+            if path not in self.to_open:
+                self.to_open.append(path)
+            return
+        self.launch_folders([path])
+
+    def launch_folders(self, paths: list) -> None:
+        """One Dolphin call for all PATHS: tabs, or one window with tabs."""
         mode = self.args.open_mode or self.config["open_mode"]
-        if mode == "none":
+        if mode == "none" or not paths:
             return
         dolphin = which("dolphin")
         if dolphin:
-            argv = [dolphin, "--new-window", path] if mode == "window" else [dolphin, path]
+            runs = [[dolphin, "--new-window", *paths] if mode == "window" else [dolphin, *paths]]
         elif which("xdg-open"):
-            argv = [which("xdg-open"), path]
+            runs = [[which("xdg-open"), path] for path in paths]
         else:
-            self.ui.notify("Mounted", f"Open {path} in your file manager.")
+            self.ui.notify("Mounted", f"Open {', '.join(paths)} in your file manager.")
             return
-        self.log.debug(f"opening: {' '.join(argv)}")
-        try:
-            subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                             stderr=subprocess.DEVNULL, start_new_session=True)
-        except OSError as error:
-            self.ui.notify("Could not open the folder", f"{path}: {error.strerror}")
+        for argv in runs:
+            self.log.debug(f"opening: {' '.join(argv)}")
+            try:
+                subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL, start_new_session=True)
+            except OSError as error:
+                self.ui.notify("Could not open the folder", f"{argv[-1]}: {error.strerror}")
 
     @staticmethod
     def subfolder(mountpoint: str, ref: ShareRef) -> str:
@@ -1142,9 +1180,17 @@ class App:
 
     def cmd_mount(self) -> int:
         refs, status = [], 0
-        for url in self.args.urls:
+        urls = list(self.args.urls)
+        while urls:
+            url = urls.pop(0)
             try:
                 ref = parse_smb_url(remote_url(url))
+            except ServerRoot as root:
+                picked, problem = self.pick_shares(root)
+                if problem:
+                    status = max(status, problem)
+                urls[:0] = picked
+                continue
             except UsageError as error:
                 self.ui.error("Cannot mount this location", str(error))
                 status = 2
@@ -1153,9 +1199,47 @@ class App:
                 refs.append(ref)
         # No lock here: the helper serialises a user's mounts itself, and a
         # lock held across dialogs would make every other request wait.
-        for ref in refs:
-            status = max(status, self.mount_one(ref))
+        # Folders open together at the end: Dolphin started twice in quick
+        # succession opens only one of them.
+        self.to_open = []
+        try:
+            for ref in refs:
+                status = max(status, self.mount_one(ref))
+        finally:
+            folders, self.to_open = self.to_open, None
+            self.launch_folders(folders)
         return status
+
+    def pick_shares(self, root: "ServerRoot") -> tuple:
+        """(smb:// addresses of the shares picked on a server, error status)."""
+        problem = tcp_probe(root.host, root.port or 445)
+        if problem is not None and root.port is None and tcp_probe(root.host, 139) is None:
+            problem = None
+        if problem is not None:
+            self.ui.error("Cannot mount this location",
+                          f"smb://{root.host}/ does not answer as a server ({problem}). If it is "
+                          f"a workgroup, open one of its servers, then a share.")
+            return [], 1
+        shares, failure = list_shares(root.url)
+        if failure:
+            self.ui.error("Cannot list the shares", f"{root.host}: {failure}")
+            return [], 1
+        if not shares:
+            self.ui.error("No shares", f"{root.host} offers no shares that can be mounted.")
+            return [], 1
+        mounted = {source_key(e.source) for e in cifs_mounts(read_mounts())
+                   if is_own_mount(e, self.uid)}
+        items = [(f"{share}    (mounted)" if (root.host, share.lower()) in mounted else share, False)
+                 for share in shares]
+        try:
+            picked = self.ui.choose_many(f"Mount which shares on {root.host}?", items, verb="mount")
+        except UsageError as error:
+            self.ui.error("Cannot ask", str(error))
+            return [], 1
+        if not picked:
+            return [], 0
+        base = root.url.rstrip("/")
+        return [f"{base}/{urllib.parse.quote(shares[i])}/" for i in picked], 0
 
     def mount_one(self, ref: ShareRef) -> int:
         self.log.info(f"mount requested: smb:{ref.source}/{'/'.join(ref.subpath)}")

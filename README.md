@@ -18,6 +18,8 @@ Right-click a folder, or the empty background of a folder, in an `smb://` locati
 - **Fast Share Mount → Mount Here** mounts the share and opens the same folder on the mount, in a new tab (or wherever your Dolphin settings open external folders).
 - **Fast Share Mount → Mount Here in New Window** does the same in a new window.
 
+With several shares selected, each is mounted, and all open together. Used in a server's own folder (`smb://nas.local/`), the entry lists that server's shares, as Dolphin sees them with your saved login, and mounts the ones you tick; shares already mounted are marked.
+
 When kio-fuse is running, Dolphin may hand the menu a kio-fuse folder (`/run/user/<uid>/kio-fuse-…/smb/…`) instead of the `smb://` address; the tool asks kio-fuse which address the folder stands for and mounts that.
 
 Right-click anything, anywhere (a file, a folder or the background, local or remote):
@@ -49,7 +51,7 @@ One folder per server keeps shares with generic names (`Shared`, `Media`, `Backu
 - `pkexec` (polkit), or `sudo` with `ksshaskpass`
 - `kdialog` (or `zenity`) for the password prompt and dialogs
 - `gdbus` (glib2 tools), to find the address behind a kio-fuse folder and to use KWallet
-- Optional: `notify-send` for notifications; KWallet (`kwallet-query`) or libsecret (`secret-tool`) to remember passwords
+- Optional: `kioclient` (KIO) to pick shares on a server; `notify-send` for notifications; KWallet (`kwallet-query`) or libsecret (`secret-tool`) to remember passwords
 
 On openSUSE:
 

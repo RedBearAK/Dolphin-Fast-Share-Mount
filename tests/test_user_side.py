@@ -335,9 +335,15 @@ class CommandLineTests(unittest.TestCase):
         self.assertIn("Fast Share Mount mounts:", result.stdout)
 
     def test_bad_url_exit_status(self):
-        result = self.run_cli("mount", "--no-open", "smb://nas/")
+        result = self.run_cli("mount", "--no-open", "smb://")
         self.assertEqual(result.returncode, 2)
-        self.assertIn("server or workgroup", result.stderr)
+        self.assertIn("names no server", result.stderr)
+
+    def test_server_that_does_not_answer(self):
+        result = self.run_cli("mount", "--no-open", "smb://nas.invalid/")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("does not answer as a server", result.stderr)
+        self.assertIn("workgroup", result.stderr)
 
     def test_unmount_of_a_plain_folder(self):
         result = self.run_cli("unmount", "/tmp")
@@ -694,6 +700,110 @@ class ChooseManyDialogTests(unittest.TestCase):
                     mock.patch("sys.stdout", new_callable=io.StringIO), \
                     mock.patch("sys.stderr", new_callable=io.StringIO):
                 self.assertEqual(ui.choose_many("x", self.ITEMS), expected, repr(answer))
+
+
+class ShareListTests(unittest.TestCase):
+    def listing(self, stdout, returncode=0, stderr="", tool="kioclient"):
+        mock.patch.object(fsm, "which", lambda name: f"/usr/bin/{name}" if name == tool else None).start()
+        self.run = mock.patch.object(fsm, "run", return_value=subprocess.CompletedProcess(
+            [], returncode, stdout, stderr)).start()
+        self.addCleanup(mock.patch.stopall)
+        return fsm.list_shares("smb://jordan@nas.example.net/")
+
+    def test_shares_are_listed_without_hidden_or_unmountable_ones(self):
+        shares, failure = self.listing("Media\nbackups\nIPC$\nBad,Name\nMedia\n\n.\n")
+        self.assertIsNone(failure)
+        self.assertEqual(shares, ["backups", "Media"])
+        self.assertEqual(self.run.call_args.args[0], ["kioclient", "ls", "smb://jordan@nas.example.net/"])
+
+    def test_kio_failure_and_absence(self):
+        shares, failure = self.listing("", returncode=1, stderr="noise\nkioclient: Access denied")
+        self.assertEqual((shares, failure), ([], "kioclient: Access denied"))
+        shares, failure = self.listing("", tool=None)
+        self.assertEqual(shares, [])
+        self.assertIn("kioclient", failure)
+
+
+class SharePickerTests(unittest.TestCase):
+    def app(self, url, picked, shares=("Backups", "Media"), mounts=(), reachable=True):
+        args = fsm.build_parser().parse_args(["mount", url])
+        app = fsm.App(args)
+        app.uid = 1000
+        app.ui = FakeUI()
+        self.offered = []
+        app.ui.choose_many = lambda text, items, verb="unmount": \
+            self.offered.append((text, items, verb)) or picked
+        self.mounted = []
+        app.mount_one = lambda ref: self.mounted.append(ref) or 0
+        mock.patch.object(fsm, "tcp_probe", return_value=None if reachable else "refused").start()
+        mock.patch.object(fsm, "list_shares", return_value=(list(shares), None)).start()
+        mock.patch.object(fsm, "read_mounts", return_value=list(mounts)).start()
+        app.launch_folders = mock.Mock()
+        self.addCleanup(mock.patch.stopall)
+        return app
+
+    def test_picked_shares_are_mounted_with_the_address_user(self):
+        app = self.app("smb://jordan@nas.example.net/", [1, 0])
+        self.assertEqual(app.cmd_mount(), 0)
+        self.assertEqual(self.offered[0][0], "Mount which shares on nas.example.net?")
+        self.assertEqual(self.offered[0][2], "mount")
+        self.assertEqual([(r.share, r.user, r.host) for r in self.mounted],
+                         [("Media", "jordan", "nas.example.net"), ("Backups", "jordan", "nas.example.net")])
+
+    def test_mounted_shares_are_marked(self):
+        own = fsm.MountEntry("/run/dolphin-fast-share-mount/1000/nas.example.net/Nas-Media",
+                             "//nas.example.net/Media", "cifs", "rw")
+        app = self.app("smb://nas.example.net/", [], mounts=[own])
+        app.cmd_mount()
+        self.assertEqual(self.offered[0][1], [("Backups", False), ("Media    (mounted)", False)])
+
+    def test_cancel_mounts_nothing(self):
+        app = self.app("smb://nas.example.net/", None)
+        self.assertEqual(app.cmd_mount(), 0)
+        self.assertEqual(self.mounted, [])
+
+    def test_unreachable_server_is_reported_without_listing(self):
+        app = self.app("smb://WORKGROUP/", [0], reachable=False)
+        self.assertEqual(app.cmd_mount(), 1)
+        self.assertIn("workgroup", app.ui.errors[0][1])
+        fsm.list_shares.assert_not_called()
+        self.assertEqual(self.offered, [])
+
+    def test_shares_in_the_selection_and_from_the_picker_are_mounted_once(self):
+        app = self.app("smb://nas.example.net/", [0, 1])
+        app.args.urls = ["smb://nas.example.net/Media/", "smb://nas.example.net/"]
+        self.assertEqual(app.cmd_mount(), 0)
+        self.assertEqual([r.share for r in self.mounted], ["Media", "Backups"])
+
+
+class OpenFoldersTests(unittest.TestCase):
+    def app(self, mode, urls):
+        args = fsm.build_parser().parse_args(["mount", *urls])
+        app = fsm.App(args)
+        app.config["open_mode"] = mode
+        app.ui = FakeUI()
+        app.mount_one = lambda ref: app.open_folder(f"/m/{ref.share}") or 0
+        mock.patch.object(fsm, "which", lambda name: f"/usr/bin/{name}").start()
+        self.popen = mock.patch.object(fsm.subprocess, "Popen").start()
+        self.addCleanup(mock.patch.stopall)
+        return app
+
+    def test_several_mounts_open_with_one_dolphin_call(self):
+        app = self.app("tab", ["smb://nas/A", "smb://nas/B", "smb://nas/A/sub"])
+        self.assertEqual(app.cmd_mount(), 0)
+        self.assertEqual([c.args[0] for c in self.popen.call_args_list],
+                         [["/usr/bin/dolphin", "/m/A", "/m/B"]])
+
+    def test_new_window_mode_opens_one_window_with_all(self):
+        app = self.app("window", ["smb://nas/A", "smb://nas/B"])
+        app.cmd_mount()
+        self.assertEqual([c.args[0] for c in self.popen.call_args_list],
+                         [["/usr/bin/dolphin", "--new-window", "/m/A", "/m/B"]])
+
+    def test_none_mode_opens_nothing(self):
+        app = self.app("none", ["smb://nas/A"])
+        app.cmd_mount()
+        self.popen.assert_not_called()
 
 
 class FakeKWallet:
