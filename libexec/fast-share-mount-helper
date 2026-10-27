@@ -1,0 +1,594 @@
+#!/bin/bash
+#
+# fast-share-mount-helper
+#
+# Root side of Dolphin-Fast-Share-Mount. Mounts and unmounts CIFS shares at
+# /run/dolphin-fast-share-mount/<uid>/<host>/<share> for one desktop user.
+#
+# It is started by the user-side command fast-share-mount through pkexec
+# (polkit action io.github.redbearak.dolphin-fast-share-mount.mount) or sudo.
+# Every argument is validated here. Mount points are computed here and never
+# taken from the caller. The password, when there is one, arrives on stdin
+# and reaches mount.cifs through a pipe (PASSWD_FD): never argv, never the
+# environment, never a file.
+#
+# Usage:
+#   fast-share-mount-helper mount --uid UID --host HOST --share SHARE
+#           [--user USER] [--domain DOMAIN] [--port PORT] [--vers VERSION]
+#           [--guest]
+#   fast-share-mount-helper unmount --uid UID --path MOUNTPOINT [--lazy]
+#   fast-share-mount-helper unmount-all --uid UID [--lazy]
+#   fast-share-mount-helper unmount-all --every-user [--lazy]
+#   fast-share-mount-helper --version
+#
+# Output on success, one line per result on stdout, fields separated by tabs:
+#   OK         <mountpoint> <smb version>   new mount
+#   ALREADY    <mountpoint> <smb version>   this share was already mounted there
+#   UNMOUNTED  <mountpoint>
+# Output on failure, one line on stderr: CODE <tab> message <tab> detail,
+# and the exit status listed in EXIT_CODES.
+#
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+VERSION=20261026
+
+set -euo pipefail
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export LC_ALL=C
+unset PASSWD PASSWD_FILE PASSWD_FD
+umask 022
+
+MOUNT_BASE=/run/dolphin-fast-share-mount
+MOUNTINFO=/proc/self/mountinfo
+LOG_TAG=fast-share-mount-helper
+PASSWORD_MAX=512
+MOUNT_TIMEOUT=60
+UMOUNT_TIMEOUT=30
+PROBE_TIMEOUT=10
+
+declare -A EXIT_CODES=(
+    [EUSAGE]=2 [EINVALID]=3
+    [EAUTH]=10 [ENOSHARE]=11 [EHOST]=12 [EDIALECT]=13 [EBUSY]=14
+    [ENOTMOUNTED]=15 [EMISSING]=16 [EPERMS]=17 [ETIMEOUT]=18
+    [EINTERNAL]=20
+)
+
+PASSWORD=""
+
+log() {
+    local priority=$1
+    shift
+    logger -t "$LOG_TAG" -p "user.$priority" -- "$*" 2>/dev/null || true
+}
+
+one_line() {
+    local text=$1
+    text=${text//$'\t'/ }
+    text=${text//$'\r'/}
+    text=${text//$'\n'/ | }
+    printf '%s' "$text"
+}
+
+fail() {
+    local code=$1 message=$2 detail=${3:-}
+    message=$(one_line "$message")
+    detail=$(one_line "$detail")
+    log err "$code: $message${detail:+ [$detail]}"
+    printf '%s\t%s\t%s\n' "$code" "$message" "$detail" >&2
+    exit "${EXIT_CODES[$code]:-20}"
+}
+
+# ---- validation (each returns 0 when valid, prints nothing) ----------------
+
+is_valid_uid() {
+    [[ $1 =~ ^[1-9][0-9]{0,9}$ ]]
+}
+
+is_valid_host() {
+    local host=$1 label
+    local -a labels
+    (( ${#host} >= 1 && ${#host} <= 253 )) || return 1
+    [[ $host =~ ^[A-Za-z0-9.-]+$ ]] || return 1
+    [[ $host != .* && $host != *. && $host != *..* ]] || return 1
+    IFS=. read -ra labels <<< "$host"
+    for label in "${labels[@]}"; do
+        (( ${#label} >= 1 && ${#label} <= 63 )) || return 1
+        [[ $label != -* && $label != *- ]] || return 1
+    done
+}
+
+is_valid_share() {
+    local share=$1
+    (( ${#share} >= 1 && ${#share} <= 255 )) || return 1
+    [[ $share != *[/\\]* ]] || return 1
+    [[ $share != *[[:cntrl:]]* ]] || return 1
+    [[ $share != -* && $share != . && $share != .. ]] || return 1
+}
+
+is_valid_user() {
+    [[ $1 =~ ^[A-Za-z0-9._@\$-]([A-Za-z0-9._@\$\ -]{0,62}[A-Za-z0-9._@\$-])?$ ]]
+}
+
+is_valid_domain() {
+    [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]]
+}
+
+is_valid_port() {
+    [[ $1 =~ ^[1-9][0-9]{0,4}$ ]] && (( $1 <= 65535 ))
+}
+
+is_valid_vers() {
+    case $1 in
+        1.0|2.0|2.1|3|3.0|3.0.2|3.1.1|default) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Folder name for a host or share: characters outside [A-Za-z0-9._-] become
+# "_", a leading "." becomes "_", at most 100 bytes.
+safe_name() {
+    local name=$1
+    name=${name//[^A-Za-z0-9._-]/_}
+    if [[ $name == .* ]]; then
+        name=_${name:1}
+    fi
+    name=${name:0:100}
+    printf '%s' "${name:-_}"
+}
+
+# mountinfo escapes space, tab, newline and backslash as octal. Share names
+# cannot contain tab, newline or backslash (see is_valid_share), so only the
+# space needs escaping to compare a source with mountinfo's field.
+mountinfo_escape() {
+    local text=$1
+    printf '%s' "${text// /\\040}"
+}
+
+# ---- mount table -------------------------------------------------------------
+
+# Find the mount at exactly MOUNTPOINT in a mountinfo file. On success sets
+# ENTRY_SOURCE (still escaped), ENTRY_FSTYPE and ENTRY_OPTIONS (the super
+# block options, which for cifs include vers=) and returns 0. When several
+# mounts are stacked on the path, the last (topmost) one wins.
+ENTRY_SOURCE="" ENTRY_FSTYPE="" ENTRY_OPTIONS=""
+mount_entry_at() {
+    local file=$1 want=$2 line i found=1
+    local -a fields
+    ENTRY_SOURCE="" ENTRY_FSTYPE="" ENTRY_OPTIONS=""
+    while IFS= read -r line; do
+        read -ra fields <<< "$line"
+        (( ${#fields[@]} >= 10 )) || continue
+        [[ ${fields[4]} == "$want" ]] || continue
+        for (( i = 6; i < ${#fields[@]}; i++ )); do
+            if [[ ${fields[i]} == "-" ]]; then
+                ENTRY_FSTYPE=${fields[i+1]:-}
+                ENTRY_SOURCE=${fields[i+2]:-}
+                ENTRY_OPTIONS=${fields[i+3]:-}
+                found=0
+                break
+            fi
+        done
+    done < "$file"
+    return "$found"
+}
+
+# Print the mount points of cifs/smb3 mounts below PREFIX/ (one per line,
+# deepest first), from a mountinfo file.
+cifs_mounts_under() {
+    local file=$1 prefix=$2 line i
+    local -a fields
+    while IFS= read -r line; do
+        read -ra fields <<< "$line"
+        (( ${#fields[@]} >= 10 )) || continue
+        [[ ${fields[4]} == "$prefix"/* ]] || continue
+        for (( i = 6; i < ${#fields[@]}; i++ )); do
+            if [[ ${fields[i]} == "-" ]]; then
+                case ${fields[i+1]:-} in
+                    cifs|smb3) printf '%s\n' "${fields[4]}" ;;
+                esac
+                break
+            fi
+        done
+    done < "$file" | sort -r -u
+}
+
+smb_version_from_options() {
+    local options=$1 option
+    local -a list
+    IFS=, read -ra list <<< "$options"
+    for option in "${list[@]}"; do
+        if [[ $option == vers=* ]]; then
+            printf '%s' "${option#vers=}"
+            return 0
+        fi
+    done
+    printf 'unknown'
+}
+
+same_source() {
+    local a=$1 b=$2
+    [[ ${a,,} == "${b,,}" ]]
+}
+
+# ---- error classification ------------------------------------------------------
+
+# Turn mount.cifs's exit status, its stderr and the kernel's CIFS lines into
+# CLASS_CODE and CLASS_MESSAGE.
+CLASS_CODE="" CLASS_MESSAGE=""
+classify_mount_error() {
+    local status=$1 err=$2 kernel=$3 number=""
+    if [[ $err =~ mount\ error\(([0-9]+)\) ]]; then
+        number=${BASH_REMATCH[1]}
+    fi
+    if (( status == 124 )); then
+        CLASS_CODE=ETIMEOUT
+        CLASS_MESSAGE="The server did not answer within ${MOUNT_TIMEOUT} seconds"
+        return
+    fi
+    if [[ $kernel == *[Dd]"ialect not supported"* || $kernel == *"protocol negotiation failed"* \
+            || $kernel == *"negotiate protocol failed"* || $kernel == *"SMB1"*"disabled"* ]]; then
+        CLASS_CODE=EDIALECT
+        CLASS_MESSAGE="The server and this computer have no SMB version in common"
+        return
+    fi
+    case $number in
+        13)
+            CLASS_CODE=EAUTH
+            CLASS_MESSAGE="Login failed: wrong user name or password, or no access to this share"
+            ;;
+        2)
+            CLASS_CODE=ENOSHARE
+            CLASS_MESSAGE="The share was not found on the server"
+            ;;
+        6|101|110|111|113)
+            CLASS_CODE=EHOST
+            CLASS_MESSAGE="The server could not be reached"
+            ;;
+        112)
+            CLASS_CODE=EHOST
+            CLASS_MESSAGE="The server is down or only speaks SMB1"
+            ;;
+        95)
+            CLASS_CODE=EDIALECT
+            CLASS_MESSAGE="The server does not support the requested SMB version"
+            ;;
+        16)
+            CLASS_CODE=EBUSY
+            CLASS_MESSAGE="The mount point is busy"
+            ;;
+        1)
+            CLASS_CODE=EPERMS
+            CLASS_MESSAGE="The server refused the connection (operation not permitted)"
+            ;;
+        *)
+            if [[ $err == *"could not resolve address"* || $err == *"resolve"*"host"* ]]; then
+                CLASS_CODE=EHOST
+                CLASS_MESSAGE="The server name could not be resolved"
+            else
+                CLASS_CODE=EINTERNAL
+                CLASS_MESSAGE="mount.cifs failed"
+            fi
+            ;;
+    esac
+}
+
+# ---- caller and directories ------------------------------------------------------
+
+require_root() {
+    (( EUID == 0 )) || fail EPERMS "The helper must run as root"
+}
+
+# The user the mount is for. Under pkexec it must be the user who asked;
+# under sudo or a root shell the caller already holds root rights.
+check_target_uid() {
+    local uid=$1 entry
+    is_valid_uid "$uid" || fail EINVALID "Invalid user id" "$uid"
+    if [[ -n ${PKEXEC_UID:-} && $PKEXEC_UID != "$uid" ]]; then
+        fail EPERMS "A user can only manage their own mounts" "asked for uid $uid by uid $PKEXEC_UID"
+    fi
+    entry=$(getent passwd "$uid") || fail EINVALID "No such user" "uid $uid"
+    TARGET_GID=$(cut -d: -f4 <<< "$entry")
+    [[ $TARGET_GID =~ ^[0-9]+$ ]] || fail EINTERNAL "Could not read the user's group" "$entry"
+}
+
+ensure_root_dir() {
+    local path=$1 mode=$2 owner
+    if [[ -L $path ]]; then
+        fail EINTERNAL "Unexpected symbolic link in the mount tree" "$path"
+    fi
+    if [[ ! -e $path ]]; then
+        mkdir -m "$mode" -- "$path" || fail EINTERNAL "Could not create a folder" "$path"
+    fi
+    [[ -d $path ]] || fail EINTERNAL "Not a folder" "$path"
+    owner=$(stat -c %u -- "$path")
+    [[ $owner == 0 ]] || fail EINTERNAL "Folder in the mount tree not owned by root" "$path"
+    chown root:root -- "$path"
+    chmod "$mode" -- "$path"
+}
+
+# /run/dolphin-fast-share-mount/<uid>: root-owned 0700, readable and
+# traversable only by the user through an ACL.
+ensure_user_root() {
+    local uid=$1 err
+    ensure_root_dir "$MOUNT_BASE" 0755
+    ensure_root_dir "$MOUNT_BASE/$uid" 0700
+    command -v setfacl >/dev/null || fail EMISSING "setfacl is missing (package acl)"
+    if ! err=$(setfacl --set "u::rwx,g::---,o::---,u:$uid:r-x,m::r-x" -- "$MOUNT_BASE/$uid" 2>&1); then
+        fail EINTERNAL "Could not set the access list on the user's mount folder" "$err"
+    fi
+}
+
+remove_if_empty() {
+    local path
+    for path in "$@"; do
+        [[ -d $path && ! -L $path ]] && rmdir -- "$path" 2>/dev/null || true
+    done
+}
+
+read_password() {
+    local password=""
+    IFS= read -r -n "$((PASSWORD_MAX + 1))" password || true
+    if (( ${#password} > PASSWORD_MAX )); then
+        fail EINVALID "The password is longer than $PASSWORD_MAX characters"
+    fi
+    PASSWORD=$password
+}
+
+kernel_cifs_lines() {
+    local since=$1
+    if command -v journalctl >/dev/null; then
+        timeout 5 journalctl -k -q --no-pager -o cat --since "@$since" 2>/dev/null \
+            | grep -i 'cifs' | tail -n 4 || true
+    else
+        timeout 5 dmesg 2>/dev/null | grep -i 'cifs' | tail -n 4 || true
+    fi
+}
+
+# ---- commands ------------------------------------------------------------------
+
+cmd_mount() {
+    local uid="" host="" share="" user="" domain="" port="" vers="" guest=""
+    while (( $# )); do
+        case $1 in
+            --uid|--host|--share|--user|--domain|--port|--vers)
+                (( $# >= 2 )) || fail EUSAGE "Missing value for $1"
+                case $1 in
+                    --uid) uid=$2 ;;
+                    --host) host=$2 ;;
+                    --share) share=$2 ;;
+                    --user) user=$2 ;;
+                    --domain) domain=$2 ;;
+                    --port) port=$2 ;;
+                    --vers) vers=$2 ;;
+                esac
+                shift 2
+                ;;
+            --guest) guest=1; shift ;;
+            *) fail EUSAGE "Unknown argument" "$1" ;;
+        esac
+    done
+
+    require_root
+    check_target_uid "$uid"
+    host=${host,,}
+    is_valid_host "$host" || fail EINVALID "Invalid server name" "$host"
+    is_valid_share "$share" || fail EINVALID "Invalid share name" "$share"
+    if [[ -z $guest ]]; then
+        is_valid_user "$user" || fail EINVALID "Invalid user name" "$user"
+    fi
+    [[ -z $domain ]] || is_valid_domain "$domain" || fail EINVALID "Invalid domain" "$domain"
+    [[ -z $port ]] || is_valid_port "$port" || fail EINVALID "Invalid port" "$port"
+    [[ -z $vers ]] || is_valid_vers "$vers" || fail EINVALID "Invalid SMB version" "$vers"
+    command -v mount.cifs >/dev/null || fail EMISSING "mount.cifs is missing (package cifs-utils)"
+
+    if [[ -z $guest ]]; then
+        read_password
+    fi
+
+    ensure_user_root "$uid"
+    local host_dir
+    host_dir="$MOUNT_BASE/$uid/$(safe_name "$host")"
+    ensure_root_dir "$host_dir" 0755
+
+    local source="//$host/$share" escaped_source mountpoint="" candidate suffix existing
+    escaped_source=$(mountinfo_escape "$source")
+    # Share names are case-insensitive, folder names are not: look for this
+    # share at any mount point of this host, not only at the expected name.
+    while IFS= read -r existing; do
+        [[ -n $existing ]] || continue
+        if mount_entry_at "$MOUNTINFO" "$existing" && same_source "$ENTRY_SOURCE" "$escaped_source"; then
+            printf 'ALREADY\t%s\t%s\n' "$existing" "$(smb_version_from_options "$ENTRY_OPTIONS")"
+            log info "already mounted: $source at $existing"
+            return 0
+        fi
+    done < <(cifs_mounts_under "$MOUNTINFO" "$host_dir")
+    for suffix in "" "~2" "~3" "~4" "~5" "~6" "~7" "~8" "~9"; do
+        candidate="$host_dir/$(safe_name "$share")$suffix"
+        if mount_entry_at "$MOUNTINFO" "$candidate"; then
+            continue
+        fi
+        if [[ -L $candidate ]]; then
+            fail EINTERNAL "Unexpected symbolic link in the mount tree" "$candidate"
+        fi
+        if [[ -e $candidate ]]; then
+            [[ -d $candidate ]] || fail EINTERNAL "Not a folder" "$candidate"
+            if [[ -n $(ls -A -- "$candidate") ]]; then
+                continue
+            fi
+        else
+            mkdir -m 0755 -- "$candidate" || fail EINTERNAL "Could not create the mount point" "$candidate"
+        fi
+        mountpoint=$candidate
+        break
+    done
+    [[ -n $mountpoint ]] || fail EINTERNAL "No free mount point name for this share" "$host_dir"
+
+    local options="uid=$uid,gid=$TARGET_GID,forceuid,forcegid,noperm,nosuid,nodev,iocharset=utf8,echo_interval=15"
+    if [[ -n $guest ]]; then
+        options+=",guest"
+    else
+        options+=",username=$user"
+    fi
+    [[ -z $domain ]] || options+=",domain=$domain"
+    [[ -z $port ]] || options+=",port=$port"
+    [[ -z $vers ]] || options+=",vers=$vers"
+
+    log info "mounting $source at $mountpoint (options: $options)"
+    local started err="" status=0 kernel
+    started=$(date +%s)
+    if [[ -n $guest ]]; then
+        err=$(timeout "$MOUNT_TIMEOUT" mount.cifs "$source" "$mountpoint" -o "$options" 2>&1 >/dev/null) \
+            || status=$?
+    else
+        err=$(PASSWD_FD=3 timeout "$MOUNT_TIMEOUT" mount.cifs "$source" "$mountpoint" -o "$options" \
+                3< <(printf '%s' "$PASSWORD") 2>&1 >/dev/null) \
+            || status=$?
+    fi
+    PASSWORD=""
+
+    if (( status != 0 )); then
+        kernel=$(kernel_cifs_lines "$started")
+        remove_if_empty "$mountpoint" "$host_dir"
+        classify_mount_error "$status" "$err" "$kernel"
+        fail "$CLASS_CODE" "$CLASS_MESSAGE" "mount.cifs exit $status: $err${kernel:+ | kernel: $kernel}"
+    fi
+
+    if ! mount_entry_at "$MOUNTINFO" "$mountpoint" || [[ $ENTRY_FSTYPE != cifs && $ENTRY_FSTYPE != smb3 ]]; then
+        remove_if_empty "$mountpoint" "$host_dir"
+        fail EINTERNAL "mount.cifs reported success but no CIFS mount is present" "$mountpoint"
+    fi
+    if ! timeout "$PROBE_TIMEOUT" stat -- "$mountpoint/." >/dev/null 2>&1; then
+        timeout "$UMOUNT_TIMEOUT" umount -l -- "$mountpoint" 2>/dev/null || true
+        remove_if_empty "$mountpoint" "$host_dir"
+        fail EHOST "The share was mounted but cannot be read" "$mountpoint"
+    fi
+
+    local vers_used
+    vers_used=$(smb_version_from_options "$ENTRY_OPTIONS")
+    log info "mounted $source at $mountpoint (SMB $vers_used)"
+    printf 'OK\t%s\t%s\n' "$mountpoint" "$vers_used"
+}
+
+# Unmount one of the tool's mounts. Prints UNMOUNTED on success; on failure
+# sets UNMOUNT_CODE/UNMOUNT_MESSAGE/UNMOUNT_DETAIL and returns 1.
+UNMOUNT_CODE="" UNMOUNT_MESSAGE="" UNMOUNT_DETAIL=""
+unmount_one() {
+    local mountpoint=$1 lazy=$2 err="" status=0
+    local -a args=()
+    [[ -z $lazy ]] || args+=(-l)
+    err=$(timeout "$UMOUNT_TIMEOUT" umount "${args[@]}" -- "$mountpoint" 2>&1) || status=$?
+    if (( status != 0 )); then
+        UNMOUNT_DETAIL="umount exit $status: $err"
+        if (( status == 124 )); then
+            UNMOUNT_CODE=ETIMEOUT
+            UNMOUNT_MESSAGE="The server did not answer; a forced unmount detaches the share anyway"
+        elif [[ $err == *busy* ]]; then
+            UNMOUNT_CODE=EBUSY
+            UNMOUNT_MESSAGE="The share is in use (an open file, a terminal or a program inside it)"
+        else
+            UNMOUNT_CODE=EINTERNAL
+            UNMOUNT_MESSAGE="umount failed"
+        fi
+        log err "unmount of $mountpoint failed: $UNMOUNT_DETAIL"
+        return 1
+    fi
+    remove_if_empty "$mountpoint" "${mountpoint%/*}"
+    log info "unmounted $mountpoint${lazy:+ (lazy)}"
+    printf 'UNMOUNTED\t%s\n' "$mountpoint"
+}
+
+# A path the tool may unmount: exactly <base>/<uid>/<host>/<share>.
+is_tool_mountpoint_path() {
+    local path=$1 uid=$2 rest host_part share_part
+    [[ $path == "$MOUNT_BASE/$uid/"* ]] || return 1
+    rest=${path#"$MOUNT_BASE/$uid/"}
+    [[ $rest == */* && $rest != */*/* ]] || return 1
+    host_part=${rest%%/*}
+    share_part=${rest#*/}
+    [[ $host_part =~ ^[A-Za-z0-9._-]+$ && $share_part =~ ^[A-Za-z0-9._~-]+$ ]] || return 1
+    [[ $host_part != . && $host_part != .. && $share_part != . && $share_part != .. ]] || return 1
+}
+
+cmd_unmount() {
+    local uid="" path="" lazy=""
+    while (( $# )); do
+        case $1 in
+            --uid|--path)
+                (( $# >= 2 )) || fail EUSAGE "Missing value for $1"
+                if [[ $1 == --uid ]]; then uid=$2; else path=$2; fi
+                shift 2
+                ;;
+            --lazy) lazy=1; shift ;;
+            *) fail EUSAGE "Unknown argument" "$1" ;;
+        esac
+    done
+    require_root
+    check_target_uid "$uid"
+    is_tool_mountpoint_path "$path" "$uid" || fail EINVALID "Not a mount point of this tool" "$path"
+    if [[ -L ${path%/*} || -L $path ]]; then
+        fail EINTERNAL "Unexpected symbolic link in the mount tree" "$path"
+    fi
+    if ! mount_entry_at "$MOUNTINFO" "$path" || [[ $ENTRY_FSTYPE != cifs && $ENTRY_FSTYPE != smb3 ]]; then
+        remove_if_empty "$path" "${path%/*}"
+        fail ENOTMOUNTED "Nothing is mounted there" "$path"
+    fi
+    unmount_one "$path" "$lazy" || fail "$UNMOUNT_CODE" "$UNMOUNT_MESSAGE" "$UNMOUNT_DETAIL"
+}
+
+cmd_unmount_all() {
+    local uid="" every="" lazy="" root mountpoint failed=0 first_code="" details=""
+    while (( $# )); do
+        case $1 in
+            --uid)
+                (( $# >= 2 )) || fail EUSAGE "Missing value for $1"
+                uid=$2
+                shift 2
+                ;;
+            --every-user) every=1; shift ;;
+            --lazy) lazy=1; shift ;;
+            *) fail EUSAGE "Unknown argument" "$1" ;;
+        esac
+    done
+    require_root
+    if [[ -n $every ]]; then
+        [[ -z $uid ]] || fail EUSAGE "Give either --uid or --every-user"
+        [[ -z ${PKEXEC_UID:-} ]] || fail EPERMS "--every-user is for administrators (sudo), not pkexec"
+        root=$MOUNT_BASE
+    else
+        check_target_uid "$uid"
+        root=$MOUNT_BASE/$uid
+    fi
+    [[ ! -L $root ]] || fail EINTERNAL "Unexpected symbolic link in the mount tree" "$root"
+
+    while IFS= read -r mountpoint; do
+        [[ -n $mountpoint ]] || continue
+        if ! unmount_one "$mountpoint" "$lazy"; then
+            failed=$((failed + 1))
+            first_code=${first_code:-$UNMOUNT_CODE}
+            details+="$mountpoint: $UNMOUNT_MESSAGE; "
+        fi
+    done < <(cifs_mounts_under "$MOUNTINFO" "$root")
+
+    if [[ -d $root && ! -L $root ]]; then
+        find "$root" -xdev -mindepth 1 -depth -type d -empty -delete 2>/dev/null || true
+    fi
+    if (( failed > 0 )); then
+        fail "$first_code" "$failed mount(s) could not be unmounted" "$details"
+    fi
+}
+
+main() {
+    case ${1:-} in
+        mount) shift; cmd_mount "$@" ;;
+        unmount) shift; cmd_unmount "$@" ;;
+        unmount-all) shift; cmd_unmount_all "$@" ;;
+        --version|version) printf '%s\n' "$VERSION" ;;
+        *) fail EUSAGE "Usage: fast-share-mount-helper mount|unmount|unmount-all|--version ..." ;;
+    esac
+}
+
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+    main "$@"
+fi
+
+# End of File #

@@ -1,0 +1,182 @@
+# Dolphin-Fast-Share-Mount
+
+A right-click action for Dolphin (KDE Plasma 5.22+ and 6) that turns the `smb://` share you are browsing into a real kernel CIFS mount and opens it.
+
+You get two things Dolphin's own `smb://` browsing does not give you:
+
+- **A real folder path.** Files on the share can be dragged into web browsers, upload dialogs and any other program that only understands local paths.
+- **Kernel speed.** Dolphin reads `smb://` through KIO's user-space SMB client, which on gigabit typically manages 40–60 MiB/s and wanders. The kernel CIFS client fills the link (around 110 MiB/s) in both directions, and large uploads to the share are where the difference shows most.
+
+Mounts are transient. Nothing is added to fstab, nothing runs at boot, and nothing is left after a reboot. There is no daemon.
+
+If you want the opposite, permanent mounts of network shares that come back after a reboot, have a look at [netmnt](https://github.com/thongor77/netmnt), which adds persistent mounting to Dolphin's context menu.
+
+## How it looks
+
+Right-click a folder, or the empty background of a folder, in an `smb://` location:
+
+- **Fast share mount → Mount here (fast)** mounts the share and opens the same folder on the mount, in a new tab (or wherever your Dolphin settings open external folders).
+- **Fast share mount → Mount here (fast), new window** does the same in a new window.
+
+Right-click a folder on the mount (any local folder shows the entry; it explains itself when used elsewhere):
+
+- **Fast share mount → Unmount fast share mount**
+
+Every outcome is a desktop notification, and every failure is also a dialog that names the cause: wrong password, share not found, server not reachable, a missing component with the command that installs it, or a dismissed authorisation request.
+
+The mount appears at:
+
+```
+/run/dolphin-fast-share-mount/<your uid>/<server>/<share>
+```
+
+One folder per server keeps shares with generic names (`Shared`, `Media`, `Backups`) on different servers apart. Characters other than letters, digits, `.`, `_` and `-` become `_` in the folder name, so the share `My Share` on `nas` is at `.../nas/My_Share`.
+
+## Requirements
+
+- KDE Plasma 5.22 or later (KDE Frameworks 5.85+) or Plasma 6, with Dolphin
+- `mount.cifs` (package `cifs-utils`)
+- `setfacl` (package `acl`)
+- `/usr/bin/python3` 3.10 or later (standard library only)
+- `pkexec` (polkit), or `sudo` with `ksshaskpass`
+- `kdialog` (or `zenity`) for the password prompt and dialogs
+- Optional: `notify-send` for notifications, KWallet (`kwallet-query`) or libsecret (`secret-tool`) to remember passwords
+
+On openSUSE:
+
+```
+sudo zypper install cifs-utils acl kdialog libnotify-tools kwallet-tools
+```
+
+## Install
+
+```
+git clone https://github.com/RedBearAK/Dolphin-Fast-Share-Mount.git
+cd Dolphin-Fast-Share-Mount
+./install.sh
+```
+
+Run it as yourself, not with sudo. It asks for root rights once, for the system part, and installs:
+
+| Part | Where |
+|---|---|
+| Command `fast-share-mount` | `~/.local/bin/` |
+| Dolphin menus | `~/.local/share/kio/servicemenus/` |
+| Settings template (only if you have none) | `~/.config/dolphin-fast-share-mount.conf` |
+| Uninstaller copy and file list | `~/.local/share/dolphin-fast-share-mount/` |
+| Root helper | `/usr/local/libexec/fast-share-mount-helper` |
+| polkit action | `/usr/share/polkit-1/actions/io.github.redbearak.dolphin-fast-share-mount.policy` |
+| Uninstaller copy and file list | `/usr/local/share/dolphin-fast-share-mount/` |
+
+Running `./install.sh` again repairs an installation: every file is written again with the right permissions, and files an older version installed but this one no longer uses are removed. Your settings file is never overwritten.
+
+Afterwards, check what the tool found on your system:
+
+```
+fast-share-mount check
+```
+
+## Uninstall
+
+```
+~/.local/share/dolphin-fast-share-mount/uninstall.sh
+```
+
+(or `./uninstall.sh` from the project folder). It unmounts the tool's shares first, then removes everything the installer put in place, the log, your settings and the passwords the tool saved. Use `--keep-config` and `--keep-passwords` to keep those. If a share is still in use it stops and says which; `--force` detaches it anyway. Running it twice is harmless.
+
+## Command line
+
+```
+fast-share-mount mount [--tab|--window|--no-open] [--user NAME] [--guest] [--vers VERSION] URL...
+fast-share-mount unmount [--force] PATH|URL|SERVER/SHARE...
+fast-share-mount unmount --all
+fast-share-mount list
+fast-share-mount check
+fast-share-mount forget USER@SERVER
+fast-share-mount forget --all
+fast-share-mount --version
+```
+
+Examples:
+
+```
+fast-share-mount mount smb://nas.local/Media/Films
+fast-share-mount mount smb://CORP;kkf@fileserver/Projects
+fast-share-mount mount smb://guest@printer-box/Scans
+fast-share-mount unmount nas.local/Media
+```
+
+The user name comes from the address (`smb://user@server/share`), else from the settings file, else your login name. `smb://guest@...` or `--guest` connects without a password. In a terminal, the command prints its messages and prompts there; from the Dolphin menu it uses notifications and dialogs.
+
+## Settings
+
+`~/.config/dolphin-fast-share-mount.conf`, one `key=value` per line. The file is read, never executed.
+
+| Setting | Values | Default |
+|---|---|---|
+| `user` | user name for addresses that name none | your login name |
+| `domain` | Windows domain or workgroup | none |
+| `smb_version` | `3.1.1`, `3.0.2`, `3.0`, `3`, `2.1`, `2.0`, `default`, `1.0` | empty: the kernel picks the newest version both sides speak (2.1 or later) |
+| `open_mode` | `tab`, `window`, `none` | `tab` |
+| `remember_password` | `ask`, `always`, `never` | `ask` |
+
+SMB1 (`1.0`) is never used unless you set it here, because it is insecure. A server that only speaks SMB1 produces an error that says so.
+
+## How it works, and why it is safe
+
+Mounting needs root, so the tool has two halves.
+
+`fast-share-mount` runs as you. It reads the address Dolphin passes, checks whether the share is already mounted (by this tool, or by anything else such as fstab or Smb4K, in which case it opens that mount instead of stacking a second one), checks that the server answers on its SMB port, gets the password from KWallet or asks for it, and starts the helper through pkexec.
+
+`fast-share-mount-helper` is a short bash script, the only code that runs as root. It:
+
+- validates every argument (server name, share name, user name, domain, port, SMB version) and computes the mount point itself; nothing the caller passes becomes a path;
+- under pkexec, only mounts for the user who asked;
+- receives the password on stdin and hands it to `mount.cifs` through a pipe, so it never appears in a process list, an environment or a file;
+- keeps the whole tree under `/run/dolphin-fast-share-mount` owned by root, so no user can swap a folder for a symbolic link and redirect a mount; your own folder in it is `0700` with an access list that lets only you in, so other users on the computer cannot see which servers and shares you have mounted, let alone the files;
+- mounts with `uid`/`gid` set to you, `noperm` (the server enforces permissions), `nosuid` and `nodev`;
+- checks the mount is really there and readable before reporting success.
+
+The user side only starts a helper that is owned by root in folders only root can change. The polkit action uses `auth_admin_keep`: one password prompt covers a few minutes of mounting and unmounting.
+
+If you want to mount without a password prompt, a polkit rule can allow it for one group. This is not installed by default. As an example, `/etc/polkit-1/rules.d/49-fast-share-mount.rules`:
+
+```
+polkit.addRule(function(action, subject) {
+    if (action.id == "io.github.redbearak.dolphin-fast-share-mount.mount" &&
+        subject.active && subject.local && subject.isInGroup("wheel")) {
+        return polkit.Result.YES;
+    }
+});
+```
+
+## Logs
+
+Each attempt is logged to the journal and to `~/.local/state/dolphin-fast-share-mount/log`. To see both halves of an attempt:
+
+```
+journalctl -t fast-share-mount -t fast-share-mount-helper --since "10 min ago"
+```
+
+Set `FAST_SHARE_MOUNT_DEBUG=1` to log the commands run (passwords are never logged).
+
+## Limitations
+
+- Shares stay mounted until you unmount them or reboot; there is no idle timeout.
+- IPv6 address literals in the address (`smb://[fe80::1]/share`) are not supported yet; use the server's name.
+- The unmount entry appears on every local folder, because Dolphin menus cannot check whether a folder is a mount.
+- Only SMB/CIFS. NFS may follow with the same helper design.
+
+## Development
+
+```
+tests/run.sh
+```
+
+runs `bash -n`, `shellcheck` (when installed) and the unit tests (Python `unittest`, no other dependencies). The helper's functions are tested by sourcing it into bash, and its mount command runs against a stub `mount.cifs`, so none of this needs root.
+
+`tests/integration/samba-test.sh` mounts real shares from a Samba container (podman or docker) and needs `cifs-utils` and sudo. GitHub Actions runs both.
+
+## Licence
+
+GPL-3.0-or-later. See [LICENSE](LICENSE).

@@ -1,0 +1,25 @@
+# Dolphin-Fast-Share-Mount settings
+#
+# One setting per line as key=value. Lines starting with # are ignored.
+# Remove the # in front of a line to use it.
+
+# User name for servers whose address does not name one.
+# Default: your login name on this computer.
+#user=
+
+# Windows domain or workgroup to log in to, when the server needs one.
+#domain=
+
+# Pin the SMB version: 3.1.1, 3.0.2, 3.0, 3, 2.1, 2.0, default, or 1.0.
+# Empty lets the kernel pick the newest version both sides speak (2.1 or
+# later). 1.0 (SMB1) is insecure; set it only for an old server that needs it.
+#smb_version=
+
+# Where to open the mounted share: tab (Dolphin's own setting decides,
+# usually a new tab in the open window), window, or none.
+#open_mode=tab
+
+# Save a password you typed: ask, always, or never.
+#remember_password=ask
+
+# End of File #

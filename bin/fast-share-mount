@@ -1,0 +1,1286 @@
+#!/usr/bin/python3 -I
+"""
+fast-share-mount - user side of Dolphin-Fast-Share-Mount.
+
+Turns an smb:// location into a transient kernel CIFS mount at
+/run/dolphin-fast-share-mount/<uid>/<host>/<share> and opens it, so files can
+be dragged into other programs and copied at kernel speed. The privileged
+part is fast-share-mount-helper, started through pkexec or sudo; this script
+never runs as root and never passes a password on a command line.
+
+Standard library only. The shebang runs the system Python in isolated mode
+(-I), so PYTHONPATH, the user's site-packages and active virtual
+environments cannot change what runs.
+
+SPDX-License-Identifier: GPL-3.0-or-later
+"""
+
+import argparse
+import fcntl
+import functools
+import getpass
+import os
+import re
+import shutil
+import socket
+import stat
+import subprocess
+import sys
+import syslog
+import time
+import urllib.parse
+from dataclasses import dataclass
+
+VERSION = "20261026"
+
+APP_ID = "dolphin-fast-share-mount"
+APP_NAME = "Fast Share Mount"
+COMMAND = "fast-share-mount"
+MOUNT_BASE = "/run/dolphin-fast-share-mount"
+HELPER_CANDIDATES = (
+    "/usr/libexec/fast-share-mount-helper",
+    "/usr/local/libexec/fast-share-mount-helper",
+)
+POLKIT_ACTION = "io.github.redbearak.dolphin-fast-share-mount.mount"
+SERVICE_MENUS = ("dolphin-fast-share-mount.desktop", "dolphin-fast-share-mount-unmount.desktop")
+SEARCH_PATH = "/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin"
+LOG_MAX_BYTES = 1024 * 1024
+HELPER_TIMEOUT = 600
+PROBE_TIMEOUT = 5
+ICON = "folder-network"
+SMB_VERSIONS = ("1.0", "2.0", "2.1", "3", "3.0", "3.0.2", "3.1.1", "default")
+
+DEFAULT_CONFIG = {
+    "user": "",
+    "domain": "",
+    "smb_version": "",
+    "open_mode": "tab",
+    "remember_password": "ask",
+}
+CONFIG_CHOICES = {
+    "smb_version": ("",) + SMB_VERSIONS,
+    "open_mode": ("tab", "window", "none"),
+    "remember_password": ("ask", "always", "never"),
+}
+
+
+class UsageError(Exception):
+    """A request that cannot be carried out as given (bad URL, bad path...)."""
+
+
+# ---- validation (mirrors fast-share-mount-helper; the helper is the authority) ----
+
+_HOST_CHARS = re.compile(r"[A-Za-z0-9.-]+")
+_USER_RE = re.compile(r"[A-Za-z0-9._@$-]([A-Za-z0-9._@$ -]{0,62}[A-Za-z0-9._@$-])?")
+_DOMAIN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+
+
+def is_valid_host(host: str) -> bool:
+    if not 1 <= len(host) <= 253 or not _HOST_CHARS.fullmatch(host):
+        return False
+    if host.startswith(".") or host.endswith(".") or ".." in host:
+        return False
+    for label in host.split("."):
+        if not 1 <= len(label) <= 63 or label.startswith("-") or label.endswith("-"):
+            return False
+    return True
+
+
+def is_valid_share(share: str) -> bool:
+    size = len(share.encode("utf-8", "surrogateescape"))
+    if not 1 <= size <= 255:
+        return False
+    if "/" in share or "\\" in share:
+        return False
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in share):
+        return False
+    return not (share.startswith("-") or share in (".", ".."))
+
+
+def is_valid_user(user: str) -> bool:
+    return bool(_USER_RE.fullmatch(user))
+
+
+def is_valid_domain(domain: str) -> bool:
+    return bool(_DOMAIN_RE.fullmatch(domain))
+
+
+# ---- smb:// URLs ---------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ShareRef:
+    host: str
+    share: str
+    subpath: tuple
+    user: str | None = None
+    domain: str | None = None
+    port: int | None = None
+
+    @property
+    def source(self) -> str:
+        return f"//{self.host}/{self.share}"
+
+    @property
+    def key(self) -> tuple:
+        return (self.host.lower(), self.share.lower())
+
+
+def parse_smb_url(url: str) -> ShareRef:
+    """Parse smb://[domain;][user[:password]@]host[:port]/share[/sub/path].
+
+    A password in the URL is ignored and never logged."""
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme.lower() != "smb":
+        raise UsageError(f"Not an smb:// address: {redact(url)}")
+    if not parts.netloc:
+        raise UsageError("The address names no server.")
+    userinfo, has_user, hostport = parts.netloc.rpartition("@")
+    user = domain = None
+    if has_user:
+        login = urllib.parse.unquote(userinfo.split(":", 1)[0])
+        if ";" in login:
+            domain, user = login.split(";", 1)
+        elif "\\" in login:
+            domain, user = login.split("\\", 1)
+        else:
+            user = login
+        user = user or None
+        domain = domain or None
+    if hostport.startswith("["):
+        raise UsageError("IPv6 address literals are not supported yet; use the server's name.")
+    host_text, _, port_text = hostport.partition(":")
+    host = urllib.parse.unquote(host_text).lower()
+    if not host:
+        raise UsageError("The address names no server.")
+    port = None
+    if port_text:
+        if not port_text.isdigit() or not 1 <= int(port_text) <= 65535:
+            raise UsageError(f"Invalid port in the address: {port_text}")
+        port = int(port_text)
+    segments = [urllib.parse.unquote(s) for s in parts.path.split("/") if s]
+    if not segments:
+        raise UsageError(
+            f"smb://{host}/ is a server or workgroup, not a share. Open one of its shares first."
+        )
+    share, subpath = segments[0], tuple(segments[1:])
+    if not is_valid_host(host):
+        raise UsageError(f"Server name not supported: {host}")
+    if not is_valid_share(share):
+        raise UsageError(f"Share name not supported: {share}")
+    if any(s in (".", "..") or "\0" in s for s in subpath):
+        raise UsageError("The address contains '.' or '..' folders.")
+    if user is not None and not is_valid_user(user):
+        raise UsageError(f"User name not supported: {user}")
+    if domain is not None and not is_valid_domain(domain):
+        raise UsageError(f"Domain not supported: {domain}")
+    return ShareRef(host, share, subpath, user, domain, port)
+
+
+_URL_PASSWORD = re.compile(r"(://[^/@:]*:)[^/@]*@")
+_OPTION_PASSWORD = re.compile(r"(pass(?:word)?=)[^,\s]*", re.IGNORECASE)
+
+
+def redact(text: str) -> str:
+    text = _URL_PASSWORD.sub(r"\1***@", text)
+    return _OPTION_PASSWORD.sub(r"\1***", text)
+
+
+# ---- configuration -------------------------------------------------------------------
+
+
+def config_path() -> str:
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return os.path.join(base, f"{APP_ID}.conf")
+
+
+def parse_config(text: str) -> tuple:
+    """key=value lines; '#' starts a comment line. Returns (config, warnings)."""
+    config = dict(DEFAULT_CONFIG)
+    warnings = []
+    seen = set()
+    for number, raw in enumerate(text.splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        key, sep, value = line.partition("=")
+        key, value = key.strip(), value.strip()
+        if not sep:
+            warnings.append(f"line {number}: no '=' (ignored): {line}")
+            continue
+        if key not in DEFAULT_CONFIG:
+            warnings.append(f"line {number}: unknown setting '{key}' (ignored)")
+            continue
+        if key in seen:
+            warnings.append(f"line {number}: '{key}' set again; the later value wins")
+        seen.add(key)
+        choices = CONFIG_CHOICES.get(key)
+        if choices is not None and value not in choices:
+            warnings.append(
+                f"line {number}: '{value}' is not valid for {key} "
+                f"(choose from {', '.join(c or '(empty)' for c in choices)}); "
+                f"keeping '{config[key]}'"
+            )
+            continue
+        if key == "user" and value and not is_valid_user(value):
+            warnings.append(f"line {number}: user name '{value}' not supported (ignored)")
+            continue
+        if key == "domain" and value and not is_valid_domain(value):
+            warnings.append(f"line {number}: domain '{value}' not supported (ignored)")
+            continue
+        config[key] = value
+    return config, warnings
+
+
+def load_config() -> tuple:
+    path = config_path()
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return parse_config(handle.read())
+    except FileNotFoundError:
+        return dict(DEFAULT_CONFIG), []
+    except OSError as error:
+        return dict(DEFAULT_CONFIG), [f"could not read {path}: {error.strerror}"]
+
+
+# ---- logging ---------------------------------------------------------------------------
+
+
+def state_dir() -> str:
+    base = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
+    return os.path.join(base, APP_ID)
+
+
+class Log:
+    PRIORITIES = {"debug": syslog.LOG_DEBUG, "info": syslog.LOG_INFO,
+                  "warning": syslog.LOG_WARNING, "error": syslog.LOG_ERR}
+
+    def __init__(self, debug: bool = False):
+        self.debug_enabled = debug
+        self.path = os.path.join(state_dir(), "log")
+        syslog.openlog(COMMAND, syslog.LOG_PID, syslog.LOG_USER)
+
+    def write(self, level: str, message: str) -> None:
+        if level == "debug" and not self.debug_enabled:
+            return
+        message = redact(message).replace("\n", " | ")
+        try:
+            syslog.syslog(self.PRIORITIES[level], message)
+        except OSError:
+            pass
+        try:
+            os.makedirs(os.path.dirname(self.path), mode=0o700, exist_ok=True)
+            if os.path.exists(self.path) and os.path.getsize(self.path) > LOG_MAX_BYTES:
+                os.replace(self.path, self.path + ".1")
+            stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+            with open(self.path, "a", encoding="utf-8") as handle:
+                handle.write(f"{stamp} {level.upper():7} {message}\n")
+        except OSError:
+            pass
+
+    def debug(self, message): self.write("debug", message)
+    def info(self, message): self.write("info", message)
+    def warning(self, message): self.write("warning", message)
+    def error(self, message): self.write("error", message)
+
+
+# ---- mount table -------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class MountEntry:
+    target: str
+    source: str
+    fstype: str
+    options: str
+
+    def option(self, name: str) -> str | None:
+        for item in self.options.split(","):
+            key, _, value = item.partition("=")
+            if key == name:
+                return value
+        return None
+
+
+_OCTAL = re.compile(r"\\([0-7]{3})")
+
+
+def mountinfo_decode(text: str) -> str:
+    return _OCTAL.sub(lambda m: chr(int(m.group(1), 8)), text)
+
+
+def parse_mountinfo(text: str) -> list:
+    entries = []
+    for line in text.splitlines():
+        fields = line.split(" ")
+        try:
+            dash = fields.index("-", 6)
+        except ValueError:
+            continue
+        if len(fields) < dash + 4:
+            continue
+        entries.append(MountEntry(
+            target=mountinfo_decode(fields[4]),
+            source=mountinfo_decode(fields[dash + 2]),
+            fstype=fields[dash + 1],
+            options=mountinfo_decode(fields[dash + 3]),
+        ))
+    return entries
+
+
+def read_mounts() -> list:
+    with open("/proc/self/mountinfo", encoding="utf-8", errors="surrogateescape") as handle:
+        return parse_mountinfo(handle.read())
+
+
+def cifs_mounts(entries: list) -> list:
+    return [e for e in entries if e.fstype in ("cifs", "smb3")]
+
+
+def own_root(uid: int) -> str:
+    return f"{MOUNT_BASE}/{uid}"
+
+
+def is_own_mount(entry: MountEntry, uid: int) -> bool:
+    return entry.target.startswith(own_root(uid) + "/")
+
+
+def source_key(source: str) -> tuple | None:
+    """'//Host/Share' -> ('host', 'share'); None for anything else."""
+    match = re.fullmatch(r"//([^/]+)/([^/]+)/?", source)
+    if not match:
+        return None
+    return (match.group(1).lower(), match.group(2).lower())
+
+
+def mount_containing(path: str, entries: list) -> MountEntry | None:
+    """The cifs mount whose target is the longest prefix of path."""
+    best = None
+    for entry in cifs_mounts(entries):
+        target = entry.target.rstrip("/") or "/"
+        if path == target or path.startswith(target + "/"):
+            if best is None or len(target) > len(best.target):
+                best = entry
+    return best
+
+
+def find_existing(ref: ShareRef, entries: list, uid: int) -> tuple:
+    """(own mount, foreign mount) of this share; either may be None.
+    Mounts of other users of this tool are ignored."""
+    own = foreign = None
+    for entry in cifs_mounts(entries):
+        if source_key(entry.source) != ref.key:
+            continue
+        if is_own_mount(entry, uid):
+            own = own or entry
+        elif not entry.target.startswith(MOUNT_BASE + "/"):
+            foreign = foreign or entry
+    return own, foreign
+
+
+def find_foreign_by_address(ref: ShareRef, entries: list) -> MountEntry | None:
+    """Second step of the duplicate check: a foreign mount of the same share
+    through another name or an IP address of the same server."""
+    candidates = []
+    for entry in cifs_mounts(entries):
+        key = source_key(entry.source)
+        if key and key[1] == ref.key[1] and key[0] != ref.key[0] \
+                and not entry.target.startswith(MOUNT_BASE + "/"):
+            candidates.append((key[0], entry))
+    if not candidates:
+        return None
+    ours = resolve(ref.host)
+    if not ours:
+        return None
+    for host, entry in candidates:
+        if resolve(host) & ours:
+            return entry
+    return None
+
+
+def resolve(host: str) -> set:
+    try:
+        return {info[4][0] for info in socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)}
+    except (OSError, UnicodeError):
+        return set()
+
+
+# ---- probes ------------------------------------------------------------------------------
+
+
+def tcp_probe(host: str, port: int, timeout: float = PROBE_TIMEOUT) -> str | None:
+    """None when host:port accepts a TCP connection, else the reason."""
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return None
+    except socket.gaierror:
+        return "the name could not be resolved"
+    except ConnectionRefusedError:
+        return f"connection refused on port {port}"
+    except TimeoutError:
+        return f"no answer on port {port} within {int(timeout)} seconds"
+    except OSError as error:
+        return f"{error.strerror or error} (port {port})"
+
+
+def path_responds(path: str, timeout: int = PROBE_TIMEOUT) -> bool:
+    """stat in a child process, so a dead server cannot hang this program."""
+    try:
+        result = subprocess.run(["timeout", str(timeout), "stat", "--", path],
+                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL, timeout=timeout + 5, check=False)
+        return result.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+# ---- external tools ---------------------------------------------------------------------
+
+
+def which(name: str) -> str | None:
+    return shutil.which(name, path=os.environ.get("PATH", "") + ":" + SEARCH_PATH)
+
+
+def run(argv: list, input_text: str | None = None, timeout: int = 30,
+        env: dict | None = None) -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run(argv, input=input_text, capture_output=True, text=True,
+                              timeout=timeout, env=env, check=False,
+                              stdin=None if input_text is not None else subprocess.DEVNULL)
+    except FileNotFoundError:
+        return subprocess.CompletedProcess(argv, 127, "", f"{argv[0]}: not found")
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(argv, 124, "", f"{argv[0]}: timed out")
+
+
+class UI:
+    """Notifications and dialogs in a desktop session; plain text in a terminal."""
+
+    def __init__(self, gui: bool, log: Log):
+        self.gui = gui
+        self.log = log
+
+    def notify(self, title: str, body: str, urgent: bool = False) -> None:
+        self.log.info(f"{title}: {body}")
+        print(f"{title}: {body}", file=sys.stderr)
+        if not self.gui:
+            return
+        if which("notify-send"):
+            argv = ["notify-send", "-a", APP_NAME, "-i", ICON,
+                    "-u", "critical" if urgent else "normal", "--", title, body]
+            if run(argv, timeout=10).returncode == 0:
+                return
+        if which("kdialog"):
+            run(["kdialog", "--title", title, "--passivepopup", body, "8"], timeout=10)
+
+    def error(self, title: str, body: str) -> None:
+        details = (f"{body}\n\nDetails: journalctl -t {COMMAND} -t {COMMAND}-helper "
+                   f"--since '{time.strftime('%Y-%m-%d %H:%M', time.localtime(time.time() - 300))}'"
+                   f"\nLog: {os.path.join(state_dir(), 'log')}")
+        self.log.error(f"{title}: {body}")
+        print(f"{title}: {body}", file=sys.stderr)
+        if not self.gui:
+            return
+        if which("kdialog"):
+            run(["kdialog", "--title", APP_NAME, "--error", f"{title}\n\n{details}"], timeout=3600)
+        elif which("zenity"):
+            run(["zenity", "--error", "--title", APP_NAME, "--text", f"{title}\n\n{details}"],
+                timeout=3600)
+        else:
+            self.notify(title, body, urgent=True)
+
+    def ask_yes_no(self, question: str) -> bool:
+        if not self.gui:
+            if not sys.stdin.isatty():
+                return False
+            answer = input(f"{question} [y/N] ")
+            return answer.strip().lower() in ("y", "yes")
+        if which("kdialog"):
+            return run(["kdialog", "--title", APP_NAME, "--yesno", question],
+                       timeout=3600).returncode == 0
+        if which("zenity"):
+            return run(["zenity", "--question", "--title", APP_NAME, "--text", question],
+                       timeout=3600).returncode == 0
+        return False
+
+    def ask_password(self, prompt: str) -> str | None:
+        """None when cancelled or no way to ask."""
+        if not self.gui:
+            if not sys.stdin.isatty():
+                return None
+            try:
+                return getpass.getpass(f"{prompt} ")
+            except (EOFError, KeyboardInterrupt):
+                return None
+        if which("kdialog"):
+            result = run(["kdialog", "--title", APP_NAME, "--password", prompt], timeout=3600)
+        elif which("zenity"):
+            result = run(["zenity", "--entry", "--hide-text", "--title", APP_NAME,
+                          "--text", prompt], timeout=3600)
+        else:
+            return None
+        if result.returncode != 0:
+            return None
+        return result.stdout[:-1] if result.stdout.endswith("\n") else result.stdout
+
+
+# ---- saved passwords ----------------------------------------------------------------------
+
+
+class PasswordStore:
+    """KWallet (folder dolphin-fast-share-mount) or libsecret, whichever works."""
+
+    def __init__(self, log: Log):
+        self.log = log
+        self.kind = None
+        if which("kwallet-query") and self._kwallet_service():
+            self.kind = "kwallet"
+        elif which("secret-tool"):
+            self.kind = "secret-tool"
+
+    @staticmethod
+    @functools.lru_cache(maxsize=1)
+    def _kwallet_service() -> tuple | None:
+        if not which("gdbus"):
+            return None
+        for version in ("6", "5"):
+            name = f"org.kde.kwalletd{version}"
+            result = run(["gdbus", "call", "--session", "--dest", "org.freedesktop.DBus",
+                          "--object-path", "/org/freedesktop/DBus",
+                          "--method", "org.freedesktop.DBus.NameHasOwner", name], timeout=10)
+            activatable = run(["gdbus", "call", "--session", "--dest", "org.freedesktop.DBus",
+                               "--object-path", "/org/freedesktop/DBus",
+                               "--method", "org.freedesktop.DBus.ListActivatableNames"],
+                              timeout=10)
+            if "true" in result.stdout or f"'{name}'" in activatable.stdout:
+                return name, f"/modules/kwalletd{version}"
+        return None
+
+    @staticmethod
+    def _wallet_name() -> str:
+        for tool in ("kreadconfig6", "kreadconfig5"):
+            if which(tool):
+                result = run([tool, "--file", "kwalletrc", "--group", "Wallet",
+                              "--key", "Default Wallet"], timeout=10)
+                if result.returncode == 0 and result.stdout.strip():
+                    return result.stdout.strip()
+        return "kdewallet"
+
+    def _kwallet_dbus(self, method: str, *args: str) -> str | None:
+        service = self._kwallet_service()
+        if not service:
+            return None
+        name, path = service
+        result = run(["gdbus", "call", "--session", "--dest", name, "--object-path", path,
+                      "--method", f"org.kde.KWallet.{method}", *args], timeout=120)
+        if result.returncode != 0:
+            self.log.warning(f"KWallet {method} failed: {result.stderr.strip()}")
+            return None
+        return result.stdout.strip()
+
+    def _kwallet_handle(self) -> str | None:
+        reply = self._kwallet_dbus("open", self._wallet_name(), "0", COMMAND)
+        match = re.match(r"\((-?\d+),?\)", reply or "")
+        if not match or int(match.group(1)) < 0:
+            return None
+        return match.group(1)
+
+    def get(self, key: str) -> str | None:
+        if self.kind == "kwallet":
+            result = run(["kwallet-query", "-f", APP_ID, "-r", key, self._wallet_name()],
+                         timeout=120)
+            if result.returncode == 0 and result.stdout not in ("", "\n"):
+                return result.stdout[:-1] if result.stdout.endswith("\n") else result.stdout
+            return None
+        if self.kind == "secret-tool":
+            result = run(["secret-tool", "lookup", "application", APP_ID, "account", key],
+                         timeout=120)
+            return result.stdout if result.returncode == 0 and result.stdout else None
+        return None
+
+    def put(self, key: str, password: str) -> bool:
+        if self.kind == "kwallet":
+            handle = self._kwallet_handle()
+            if handle is None:
+                return False
+            self._kwallet_dbus("createFolder", handle, APP_ID, COMMAND)
+            result = run(["kwallet-query", "-f", APP_ID, "-w", key, self._wallet_name()],
+                         input_text=password, timeout=120)
+            return result.returncode == 0
+        if self.kind == "secret-tool":
+            result = run(["secret-tool", "store", f"--label={APP_NAME}: {key}",
+                          "application", APP_ID, "account", key],
+                         input_text=password, timeout=120)
+            return result.returncode == 0
+        return False
+
+    def delete(self, key: str) -> bool:
+        if self.kind == "kwallet":
+            handle = self._kwallet_handle()
+            return handle is not None and \
+                self._kwallet_dbus("removeEntry", handle, APP_ID, key, COMMAND) is not None
+        if self.kind == "secret-tool":
+            return run(["secret-tool", "clear", "application", APP_ID, "account", key],
+                       timeout=120).returncode == 0
+        return False
+
+    def delete_all(self) -> bool:
+        done = False
+        if self.kind == "kwallet":
+            handle = self._kwallet_handle()
+            done = handle is not None and \
+                self._kwallet_dbus("removeFolder", handle, APP_ID, COMMAND) is not None
+        if which("secret-tool"):
+            done = run(["secret-tool", "clear", "application", APP_ID],
+                       timeout=120).returncode == 0 or done
+        return done
+
+
+def wallet_key(user: str, host: str, domain: str | None) -> str:
+    return f"{domain};{user}@{host}" if domain else f"{user}@{host}"
+
+
+# ---- the helper ------------------------------------------------------------------------------
+
+
+def is_root_secure(path: str) -> str | None:
+    """None when path is a regular file owned by root that only root can
+    change, in folders only root can change; else the reason it is not."""
+    try:
+        info = os.lstat(path)
+    except OSError as error:
+        return f"{path}: {error.strerror}"
+    if not stat.S_ISREG(info.st_mode):
+        return f"{path} is not a regular file"
+    if info.st_uid != 0 or info.st_mode & 0o022:
+        return f"{path} can be changed by a user other than root"
+    folder = os.path.dirname(path)
+    while True:
+        try:
+            info = os.lstat(folder)
+        except OSError as error:
+            return f"{folder}: {error.strerror}"
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+            return f"{folder} can be changed by a user other than root"
+        if folder == "/":
+            return None
+        folder = os.path.dirname(folder)
+
+
+def find_helper() -> tuple:
+    """(path, None) for a trusted helper, or (None, reason)."""
+    reasons = []
+    for candidate in HELPER_CANDIDATES:
+        if not os.path.lexists(candidate):
+            continue
+        problem = is_root_secure(candidate)
+        if problem is None:
+            return candidate, None
+        reasons.append(problem)
+    if reasons:
+        return None, "the helper is not safe to run as root: " + "; ".join(reasons)
+    return None, "the helper is not installed (run ./install.sh from the project folder)"
+
+
+@dataclass
+class HelperResult:
+    ok: bool
+    lines: list
+    code: str = ""
+    message: str = ""
+    detail: str = ""
+
+
+def parse_helper_output(returncode: int, stdout: str, stderr: str) -> HelperResult:
+    lines = [line.split("\t") for line in stdout.splitlines() if line.strip()]
+    if returncode == 0:
+        return HelperResult(True, lines)
+    for line in reversed(stderr.splitlines()):
+        match = re.fullmatch(r"([A-Z]+)\t([^\t]*)\t?(.*)", line)
+        if match:
+            return HelperResult(False, lines, *match.groups())
+    if returncode in (126, 127):
+        return HelperResult(False, lines, "EAUTHORIZE", "Not authorised: the request was "
+                            "dismissed or no polkit agent is running", stderr.strip())
+    if "sudo:" in stderr.lower():
+        return HelperResult(False, lines, "EAUTHORIZE", "Not authorised by sudo", stderr.strip())
+    return HelperResult(False, lines, "EINTERNAL",
+                        f"The helper failed with exit status {returncode}", stderr.strip())
+
+
+class Elevator:
+    def __init__(self, log: Log):
+        self.log = log
+
+    def methods(self, helper: str) -> list:
+        found = []
+        if which("pkexec"):
+            found.append(("pkexec", [which("pkexec"), helper], None))
+        askpass = which("ksshaskpass") or which("ssh-askpass")
+        if which("sudo") and askpass:
+            env = dict(os.environ, SUDO_ASKPASS=askpass)
+            found.append(("sudo", [which("sudo"), "-A", "--", helper], env))
+        return found
+
+    def run_helper(self, helper: str, args: list, password: str | None = None) -> HelperResult:
+        methods = self.methods(helper)
+        if not methods:
+            return HelperResult(False, [], "EMISSING",
+                                "No way to get root rights: neither pkexec nor sudo with "
+                                "an askpass program (ksshaskpass) is available")
+        result = None
+        for name, prefix, env in methods:
+            argv = prefix + args
+            self.log.debug(f"running ({name}): {' '.join(argv)}")
+            started = time.monotonic()
+            done = run(argv, input_text=(password + "\n") if password is not None else "",
+                       timeout=HELPER_TIMEOUT, env=env)
+            self.log.debug(f"{name} returned {done.returncode} after "
+                           f"{time.monotonic() - started:.1f}s; stderr: {done.stderr.strip()}")
+            result = parse_helper_output(done.returncode, done.stdout, done.stderr)
+            no_agent = name == "pkexec" and done.returncode == 127 and \
+                "agent" in done.stderr.lower()
+            if not no_agent:
+                return result
+            self.log.warning("pkexec found no polkit agent; trying the next method")
+        return result
+
+
+# ---- user-facing text -------------------------------------------------------------------------
+
+
+def os_release() -> dict:
+    values = {}
+    try:
+        with open("/etc/os-release", encoding="utf-8") as handle:
+            for line in handle:
+                key, sep, value = line.strip().partition("=")
+                if sep:
+                    values[key] = value.strip().strip('"')
+    except OSError:
+        pass
+    return values
+
+
+def package_manager() -> str | None:
+    release = os_release()
+    ids = (release.get("ID", "") + " " + release.get("ID_LIKE", "")).split()
+    if any(i.startswith("opensuse") or i in ("suse", "sles") for i in ids):
+        return "zypper"
+    for names, manager in ((("fedora", "rhel", "centos"), "dnf"),
+                           (("debian", "ubuntu"), "apt"),
+                           (("arch",), "pacman")):
+        if any(i in names for i in ids):
+            return manager
+    return None
+
+
+PACKAGES = {
+    "mount.cifs": {"*": "cifs-utils"},
+    "setfacl": {"*": "acl"},
+    "pkexec": {"zypper": "pkexec", "dnf": "polkit", "apt": "pkexec", "pacman": "polkit"},
+    "notify-send": {"zypper": "libnotify-tools", "dnf": "libnotify", "apt": "libnotify-bin",
+                    "pacman": "libnotify"},
+    "kdialog": {"*": "kdialog"},
+    "zenity": {"*": "zenity"},
+    "secret-tool": {"zypper": "libsecret-tools", "dnf": "libsecret", "apt": "libsecret-tools",
+                    "pacman": "libsecret"},
+    "kwallet-query": {"zypper": "kwallet-tools"},
+    "sudo": {"*": "sudo"},
+}
+INSTALL_COMMANDS = {"zypper": "sudo zypper install", "dnf": "sudo dnf install",
+                    "apt": "sudo apt install", "pacman": "sudo pacman -S"}
+
+
+def install_hint(tool: str) -> str:
+    manager = package_manager()
+    names = PACKAGES.get(tool, {})
+    package = names.get(manager or "", names.get("*"))
+    if manager and package:
+        return f"Install with: {INSTALL_COMMANDS[manager]} {package}"
+    if package:
+        return f"Install the package {package}."
+    return f"Install the package that provides {tool}."
+
+
+def explain(result: HelperResult, ref: ShareRef, user: str) -> tuple:
+    """(title, body) for a failed helper call."""
+    who = f"{user}@{ref.host}" if user else ref.host
+    code = result.code
+    if code == "EAUTH":
+        return ("Login failed", f"Login failed for {who}: wrong user name or password, "
+                f"or no access to the share '{ref.share}' (mount error 13).")
+    if code == "ENOSHARE":
+        return ("Share not found", f"Share '{ref.share}' not found on {ref.host} (mount error 2).")
+    if code == "EHOST":
+        return ("Server not reachable", f"{ref.host}: {result.message}.")
+    if code == "EDIALECT":
+        return ("No common SMB version", f"{ref.host}: {result.message}. If the server only "
+                f"speaks SMB1, set smb_version=1.0 in {config_path()} (SMB1 is insecure).")
+    if code == "EMISSING":
+        tool = "mount.cifs" if "mount.cifs" in result.message else \
+            "setfacl" if "setfacl" in result.message else ""
+        hint = f" {install_hint(tool)}" if tool else ""
+        return ("Required component missing", f"{result.message}.{hint}")
+    if code == "EAUTHORIZE":
+        return ("Not authorised", f"{result.message}.")
+    if code == "ETIMEOUT":
+        return ("Timed out", f"{ref.host}: {result.message}.")
+    return ("Mount failed", f"{result.message}." + (f" ({result.detail})" if result.detail else ""))
+
+
+# ---- commands --------------------------------------------------------------------------------------
+
+
+class App:
+    def __init__(self, args: argparse.Namespace):
+        self.args = args
+        self.log = Log(debug=bool(os.environ.get("FAST_SHARE_MOUNT_DEBUG")))
+        # Dialogs when asked for (the Dolphin menus pass --gui), or when there
+        # is no terminal to print to but there is a desktop session.
+        desktop = bool(os.environ.get("WAYLAND_DISPLAY") or os.environ.get("DISPLAY"))
+        gui = getattr(args, "gui", False) or (not sys.stderr.isatty() and desktop)
+        self.ui = UI(gui, self.log)
+        self.config, warnings = load_config()
+        for warning in warnings:
+            self.log.warning(f"{config_path()}: {warning}")
+        self.uid = os.getuid()
+        self.elevator = Elevator(self.log)
+
+    # -- shared pieces --
+
+    def lock(self):
+        runtime = os.environ.get("XDG_RUNTIME_DIR") or state_dir()
+        os.makedirs(runtime, mode=0o700, exist_ok=True)
+        handle = open(os.path.join(runtime, f"{APP_ID}.lock"), "w", encoding="utf-8")
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        return handle
+
+    def helper_or_error(self) -> str | None:
+        helper, problem = find_helper()
+        if helper is None:
+            self.ui.error("Helper missing", problem[0].upper() + problem[1:] + ".")
+        return helper
+
+    def open_folder(self, path: str) -> None:
+        mode = self.args.open_mode or self.config["open_mode"]
+        if mode == "none":
+            return
+        dolphin = which("dolphin")
+        if dolphin:
+            argv = [dolphin, "--new-window", path] if mode == "window" else [dolphin, path]
+        elif which("xdg-open"):
+            argv = [which("xdg-open"), path]
+        else:
+            self.ui.notify("Mounted", f"Open {path} in your file manager.")
+            return
+        self.log.debug(f"opening: {' '.join(argv)}")
+        try:
+            subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
+        except OSError as error:
+            self.ui.notify("Could not open the folder", f"{path}: {error.strerror}")
+
+    @staticmethod
+    def subfolder(mountpoint: str, ref: ShareRef) -> str:
+        if ref.subpath:
+            candidate = os.path.join(mountpoint, *ref.subpath)
+            if os.path.isdir(candidate):
+                return candidate
+        return mountpoint
+
+    # -- mount --
+
+    def cmd_mount(self) -> int:
+        refs, status = [], 0
+        for url in self.args.urls:
+            try:
+                ref = parse_smb_url(url)
+            except UsageError as error:
+                self.ui.error("Cannot mount this location", str(error))
+                status = 2
+                continue
+            if all(ref.key != other.key for other in refs):
+                refs.append(ref)
+        with self.lock():
+            for ref in refs:
+                status = max(status, self.mount_one(ref))
+        return status
+
+    def mount_one(self, ref: ShareRef) -> int:
+        self.log.info(f"mount requested: smb:{ref.source}/{'/'.join(ref.subpath)}")
+        user = self.args.user or ref.user or self.config["user"] or getpass.getuser()
+        guest = self.args.guest or user.lower() == "guest"
+        domain = ref.domain or self.config["domain"] or None
+        if not guest and not is_valid_user(user):
+            self.ui.error("Cannot mount this location", f"User name not supported: {user}")
+            return 2
+
+        entries = read_mounts()
+        own, foreign = find_existing(ref, entries, self.uid)
+        if own is not None:
+            if path_responds(own.target):
+                mounted_as = own.option("username")
+                note = ""
+                if mounted_as and not guest and mounted_as.lower() != user.lower():
+                    note = f" (logged in as {mounted_as}; unmount it to log in as {user})"
+                self.ui.notify("Already mounted", f"{ref.source} is already mounted at "
+                               f"{own.target}{note}.")
+                self.open_folder(self.subfolder(own.target, ref))
+                return 0
+            if not self.ui.ask_yes_no(f"{ref.source} is mounted at {own.target} but the server "
+                                      f"does not answer (stale mount). Detach it and mount again?"):
+                self.ui.error("Stale mount", f"{own.target} does not answer. Unmount it with: "
+                              f"{COMMAND} unmount --force {own.target}")
+                return 1
+            if self.unmount_entry(own, lazy=True) != 0:
+                return 1
+        foreign = foreign or find_foreign_by_address(ref, entries)
+        if foreign is not None:
+            self.ui.notify("Already mounted elsewhere", f"{ref.source} is already mounted at "
+                           f"{foreign.target} (not by {APP_NAME}); opening that.")
+            self.open_folder(self.subfolder(foreign.target, ref))
+            return 0
+
+        port = ref.port or 445
+        problem = tcp_probe(ref.host, port)
+        if problem is not None:
+            self.ui.error("Server not reachable", f"Server {ref.host} not reachable: {problem}.")
+            return 1
+
+        helper = self.helper_or_error()
+        if helper is None:
+            return 1
+
+        args = ["mount", "--uid", str(self.uid), "--host", ref.host, "--share", ref.share]
+        if guest:
+            args.append("--guest")
+        else:
+            args += ["--user", user]
+        if domain:
+            args += ["--domain", domain]
+        if ref.port:
+            args += ["--port", str(ref.port)]
+        vers = self.args.vers or self.config["smb_version"]
+        if vers:
+            args += ["--vers", vers]
+
+        store = PasswordStore(self.log)
+        key = wallet_key(user, ref.host, domain)
+        password, prompted = None, False
+        if not guest:
+            password = store.get(key) if store.kind else None
+            if password is None:
+                password = self.ui.ask_password(f"Password for {key} (share {ref.share}):")
+                prompted = True
+                if password is None:
+                    self.ui.notify("Cancelled", f"No password given for {key}.")
+                    return 1
+
+        for attempt in range(3):
+            result = self.elevator.run_helper(helper, args, password)
+            if result.ok or result.code != "EAUTH" or guest or attempt == 2:
+                break
+            reason = "The saved password was rejected." if not prompted else "Wrong password."
+            password = self.ui.ask_password(f"{reason} Password for {key} (share {ref.share}):")
+            prompted = True
+            if password is None:
+                break
+
+        if not result.ok:
+            title, body = explain(result, ref, "" if guest else user)
+            self.log.error(f"helper: {result.code} {result.message} [{result.detail}]")
+            self.ui.error(title, body)
+            return 1
+
+        state, mountpoint, version = (result.lines[-1] + ["", "", ""])[:3]
+        if not mountpoint or not path_responds(mountpoint):
+            self.ui.error("Mount failed", f"The helper reported {state} but {mountpoint or '?'} "
+                          f"does not answer.")
+            return 1
+        if prompted and password is not None and store.kind:
+            remember = self.config["remember_password"]
+            if remember == "always" or (remember == "ask" and self.ui.ask_yes_no(
+                    f"Remember the password for {key} ({'KWallet' if store.kind == 'kwallet' else 'keyring'})?")):
+                if not store.put(key, password):
+                    self.ui.notify("Password not saved", f"Could not save the password for {key}.")
+        if state == "ALREADY":
+            self.ui.notify("Already mounted", f"{ref.source} is already mounted at {mountpoint}.")
+        else:
+            self.ui.notify("Mounted", f"Mounted {ref.source} at {mountpoint} (SMB {version}).")
+        self.open_folder(self.subfolder(mountpoint, ref))
+        return 0
+
+    # -- unmount --
+
+    def resolve_target(self, text: str, entries: list) -> tuple:
+        """(entry or None, label) for a path, file:// URL, smb:// URL or host/share."""
+        if text.startswith("smb://"):
+            ref = parse_smb_url(text)
+            own, _ = find_existing(ref, entries, self.uid)
+            return own, ref.source
+        if text.startswith("file://"):
+            text = urllib.parse.unquote(urllib.parse.urlsplit(text).path)
+        if not text.startswith("/") and not os.path.exists(text) and text.count("/") == 1:
+            host, share = text.split("/")
+            for entry in cifs_mounts(entries):
+                if is_own_mount(entry, self.uid) and source_key(entry.source) == (host.lower(), share.lower()):
+                    return entry, text
+            return None, text
+        path = os.path.normpath(os.path.abspath(text))
+        entry = mount_containing(path, entries)
+        if entry is None and os.path.islink(text):
+            entry = mount_containing(os.path.realpath(text), entries)
+        return entry, path
+
+    def unmount_entry(self, entry: MountEntry, lazy: bool) -> int:
+        helper = self.helper_or_error()
+        if helper is None:
+            return 1
+        args = ["unmount", "--uid", str(self.uid), "--path", entry.target]
+        result = self.elevator.run_helper(helper, args + (["--lazy"] if lazy else []))
+        if not result.ok and result.code in ("EBUSY", "ETIMEOUT") and not lazy:
+            if self.ui.ask_yes_no(f"{result.message}.\n\nDetach {entry.target} anyway? Programs "
+                                  f"still using it keep their open files until they close them."):
+                result = self.elevator.run_helper(helper, args + ["--lazy"])
+        if not result.ok:
+            if result.code == "ENOTMOUNTED":
+                self.ui.notify("Not mounted", f"{entry.target} is no longer mounted.")
+                return 0
+            self.ui.error("Unmount failed", f"{entry.target}: {result.message}."
+                          + (f" ({result.detail})" if result.detail else ""))
+            return 1
+        self.ui.notify("Unmounted", f"{entry.source} ({entry.target}).")
+        return 0
+
+    def cmd_unmount(self) -> int:
+        with self.lock():
+            entries = read_mounts()
+            if self.args.all:
+                own = [e for e in cifs_mounts(entries) if is_own_mount(e, self.uid)]
+                if not own:
+                    self.ui.notify("Nothing to unmount", f"No {APP_NAME} mounts are active.")
+                    return 0
+                helper = self.helper_or_error()
+                if helper is None:
+                    return 1
+                args = ["unmount-all", "--uid", str(self.uid)] + (["--lazy"] if self.args.force else [])
+                result = self.elevator.run_helper(helper, args)
+                if not result.ok:
+                    self.ui.error("Unmount failed", f"{result.message}. {result.detail}".strip())
+                    return 1
+                self.ui.notify("Unmounted", f"{len(result.lines)} share(s) unmounted.")
+                return 0
+            if not self.args.targets:
+                self.ui.error("Nothing to unmount", "Give a path, an smb:// address or --all.")
+                return 2
+            status, done = 0, set()
+            for text in self.args.targets:
+                try:
+                    entry, label = self.resolve_target(text, entries)
+                except UsageError as error:
+                    self.ui.error("Cannot unmount", str(error))
+                    status = 2
+                    continue
+                if entry is None:
+                    self.ui.notify("Not a fast share mount", f"{label} is not on a "
+                                   f"{APP_NAME} mount; nothing to unmount.")
+                    continue
+                if not is_own_mount(entry, self.uid):
+                    self.ui.error("Not a fast share mount", f"{label} is on {entry.source}, "
+                                  f"mounted at {entry.target} by something else "
+                                  f"(fstab, Smb4K or a manual mount). Leaving it alone.")
+                    status = max(status, 1)
+                    continue
+                if entry.target in done:
+                    continue
+                done.add(entry.target)
+                status = max(status, self.unmount_entry(entry, self.args.force))
+            return status
+
+    # -- list --
+
+    def cmd_list(self) -> int:
+        entries = cifs_mounts(read_mounts())
+        own = [e for e in entries if is_own_mount(e, self.uid)]
+        other = [e for e in entries if not is_own_mount(e, self.uid)]
+        print(f"{APP_NAME} mounts:")
+        if not own:
+            print("  (none)")
+        for entry in own:
+            state = "ok" if path_responds(entry.target) else "NOT RESPONDING"
+            print(f"  {entry.source}  ->  {entry.target}  "
+                  f"(SMB {entry.option('vers') or '?'}, user {entry.option('username') or 'guest'}, {state})")
+        print("Other CIFS mounts on this system:")
+        if not other:
+            print("  (none)")
+        for entry in other:
+            mark = " (another user's fast share mount)" if entry.target.startswith(MOUNT_BASE + "/") else ""
+            print(f"  {entry.source}  ->  {entry.target}{mark}")
+        return 0
+
+    # -- check --
+
+    def cmd_check(self) -> int:
+        rows, problems = [], 0
+
+        def row(need, state, note=""):
+            rows.append((need, state, note))
+
+        helper, problem = find_helper()
+        if which("mount.cifs"):
+            row("Kernel CIFS mount", "ok", which("mount.cifs"))
+        else:
+            problems += 1
+            row("Kernel CIFS mount", "MISSING", install_hint("mount.cifs"))
+        if which("setfacl"):
+            row("Access list (setfacl)", "ok", which("setfacl"))
+        else:
+            problems += 1
+            row("Access list (setfacl)", "MISSING", install_hint("setfacl"))
+        if helper:
+            row("Root helper", "ok", helper)
+        else:
+            problems += 1
+            row("Root helper", "MISSING", problem)
+        pkaction = which("pkaction")
+        policy = pkaction and run([pkaction, "--action-id", POLKIT_ACTION], timeout=10).returncode == 0
+        askpass = which("ksshaskpass") or which("ssh-askpass")
+        if which("pkexec"):
+            row("Root rights", "ok", "pkexec, " + ("polkit action installed" if policy else
+                                                  "polkit action NOT installed (generic prompt)"))
+        elif which("sudo") and askpass:
+            row("Root rights", "ok", f"sudo -A with {askpass}")
+        else:
+            problems += 1
+            row("Root rights", "MISSING", install_hint("pkexec"))
+        if which("notify-send"):
+            row("Notifications", "ok", "notify-send")
+        elif which("kdialog"):
+            row("Notifications", "ok", "kdialog --passivepopup")
+        else:
+            row("Notifications", "none", install_hint("notify-send") + " (log only meanwhile)")
+        if which("kdialog") or which("zenity"):
+            row("Dialogs and password prompt", "ok", "kdialog" if which("kdialog") else "zenity")
+        else:
+            problems += 1
+            row("Dialogs and password prompt", "MISSING", install_hint("kdialog"))
+        store = PasswordStore(self.log)
+        row("Saved passwords", "ok" if store.kind else "none",
+            {"kwallet": "KWallet", "secret-tool": "libsecret (secret-tool)"}.get(
+                store.kind, "prompt every time; " + install_hint("kwallet-query")))
+        row("Open the mount", "ok" if which("dolphin") or which("xdg-open") else "none",
+            "dolphin" if which("dolphin") else "xdg-open" if which("xdg-open") else
+            "the path is shown in a notification")
+
+        data = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+        for name in SERVICE_MENUS:
+            places = [os.path.join(data, "kio", "servicemenus", name),
+                      os.path.join("/usr/share/kio/servicemenus", name)]
+            found = next((p for p in places if os.path.exists(p)), None)
+            if found and os.access(found, os.X_OK):
+                row(f"Service menu {name}", "ok", found)
+            elif found:
+                problems += 1
+                row(f"Service menu {name}", "NOT EXECUTABLE", f"chmod +x {found} (or re-run ./install.sh)")
+            else:
+                problems += 1
+                row(f"Service menu {name}", "MISSING", "re-run ./install.sh")
+
+        plasma = os.environ.get("KDE_SESSION_VERSION", "")
+        shell = which("plasmashell")
+        detail = run([shell, "--version"], timeout=10).stdout.strip() if shell else ""
+        row("Plasma", plasma or "?", detail or "plasmashell not found"
+            + ("; Plasma 5 older than 5.22 (KF 5.85) is not supported" if plasma == "5" else ""))
+        release = os_release()
+        row("System", release.get("PRETTY_NAME", "?"), f"package manager: {package_manager() or '?'}")
+        row("Mode", "plain mount", "no idle unmount; mounts last until unmounted or reboot")
+
+        width = max(len(r[0]) for r in rows)
+        state_width = max(len(r[1]) for r in rows)
+        print(f"{APP_NAME} {VERSION}")
+        for need, state, note in rows:
+            print(f"  {need:<{width}}  {state:<{state_width}}  {note}")
+        config_warnings = load_config()[1]
+        for warning in config_warnings:
+            print(f"  config: {warning}")
+        return 1 if problems else 0
+
+    # -- forget --
+
+    def cmd_forget(self) -> int:
+        store = PasswordStore(self.log)
+        if self.args.all:
+            ok = store.delete_all()
+            print("Saved passwords removed." if ok else "No saved passwords were removed.")
+            return 0
+        if not self.args.login:
+            print("Give user@host or --all.", file=sys.stderr)
+            return 2
+        if not store.kind:
+            print("No password store is available.", file=sys.stderr)
+            return 1
+        ok = store.delete(self.args.login)
+        print(f"Removed {self.args.login}." if ok else f"Could not remove {self.args.login}.")
+        return 0 if ok else 1
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog=COMMAND, description="Mount the SMB share you are browsing in Dolphin as a "
+        "kernel CIFS mount, for real paths and full speed.")
+    parser.add_argument("--version", action="version", version=f"{COMMAND} {VERSION}")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--gui", action="store_true",
+                        help="use notifications and dialogs even in a terminal")
+
+    mount = sub.add_parser("mount", parents=[common], help="mount the share of each smb:// URL")
+    group = mount.add_mutually_exclusive_group()
+    group.add_argument("--window", dest="open_mode", action="store_const", const="window")
+    group.add_argument("--tab", dest="open_mode", action="store_const", const="tab")
+    group.add_argument("--no-open", dest="open_mode", action="store_const", const="none")
+    mount.add_argument("--user", help="log in as this user")
+    mount.add_argument("--guest", action="store_true", help="connect as guest, no password")
+    mount.add_argument("--vers", choices=SMB_VERSIONS, help="pin the SMB version")
+    mount.add_argument("urls", nargs="+", metavar="URL")
+
+    unmount = sub.add_parser("unmount", parents=[common], help="unmount fast share mounts")
+    unmount.add_argument("--force", action="store_true",
+                         help="detach even when busy or the server is gone (lazy unmount)")
+    unmount.add_argument("--all", action="store_true", help="unmount all of your fast share mounts")
+    unmount.add_argument("targets", nargs="*", metavar="PATH|URL|HOST/SHARE")
+
+    sub.add_parser("list", parents=[common], help="list CIFS mounts")
+    sub.add_parser("check", parents=[common], help="show which components are available")
+
+    forget = sub.add_parser("forget", parents=[common], help="remove a saved password")
+    forget.add_argument("--all", action="store_true", help="remove every saved password")
+    forget.add_argument("login", nargs="?", metavar="USER@HOST")
+    return parser
+
+
+def main(argv: list | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    if not hasattr(args, "open_mode"):
+        args.open_mode = None
+    if os.geteuid() == 0:
+        print(f"{COMMAND}: run this as your desktop user, not as root.", file=sys.stderr)
+        return 2
+    app = App(args)
+    try:
+        return {"mount": app.cmd_mount, "unmount": app.cmd_unmount, "list": app.cmd_list,
+                "check": app.cmd_check, "forget": app.cmd_forget}[args.command]()
+    except KeyboardInterrupt:
+        return 130
+    except Exception as error:
+        app.log.error(f"unexpected error: {error!r}")
+        app.ui.error("Unexpected error", f"{type(error).__name__}: {error}")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+# End of File #

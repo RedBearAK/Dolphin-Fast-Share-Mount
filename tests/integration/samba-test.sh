@@ -1,0 +1,122 @@
+#!/bin/bash
+#
+# Integration test: real kernel CIFS mounts against a Samba server in a
+# container. Needs podman or docker, cifs-utils, and sudo (mounting needs
+# root). It runs the helper from this checkout directly with sudo, so the
+# installed copy is not involved, and it cleans up after itself.
+#
+#   tests/integration/samba-test.sh
+#
+# The container listens on 127.0.0.1:4445 (an unprivileged port, which also
+# tests the --port option). Image: docker.io/dperson/samba.
+#
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+set -euo pipefail
+
+ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
+HELPER="$ROOT/libexec/fast-share-mount-helper"
+IMAGE=docker.io/dperson/samba:latest
+NAME=fast-share-mount-test-samba
+PORT=4445
+TEST_USER=fsmtester
+TEST_PASSWORD='correct horse, battery=staple'
+UID_SELF=$(id -u)
+BASE=/run/dolphin-fast-share-mount/$UID_SELF
+PASSED=0
+FAILED=0
+
+engine=$(command -v podman || command -v docker || true)
+[[ -n $engine ]] || { echo "podman or docker is needed"; exit 2; }
+[[ -x /usr/sbin/mount.cifs || -x /sbin/mount.cifs ]] || { echo "cifs-utils is needed"; exit 2; }
+
+cleanup() {
+    sudo "$HELPER" unmount-all --uid "$UID_SELF" --lazy >/dev/null 2>&1 || true
+    "$engine" rm -f "$NAME" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+
+check() {
+    local name=$1 expected=$2 actual=$3
+    if [[ $actual == "$expected" ]]; then
+        PASSED=$((PASSED + 1))
+        echo "ok    $name"
+    else
+        FAILED=$((FAILED + 1))
+        echo "FAIL  $name: expected '$expected', got '$actual'"
+    fi
+}
+
+# helper ARGS... with the password on stdin; prints "status|first stdout field|stderr code"
+helper() {
+    local password=$1 out err status=0
+    shift
+    out=$(printf '%s\n' "$password" | sudo "$HELPER" "$@" 2>"$TMP/err") || status=$?
+    err=$(cut -f1 < "$TMP/err" | tail -n 1)
+    printf '%s|%s|%s' "$status" "$(cut -f1 <<< "$out" | head -n 1)" "$err"
+}
+
+TMP=$(mktemp -d)
+trap 'cleanup; rm -rf -- "$TMP"' EXIT
+
+echo "Starting Samba ($IMAGE) on 127.0.0.1:$PORT"
+"$engine" rm -f "$NAME" >/dev/null 2>&1 || true
+"$engine" run -d --rm --name "$NAME" -p "127.0.0.1:$PORT:445" "$IMAGE" -p \
+    -u "$TEST_USER;$TEST_PASSWORD" \
+    -s "Shared;/srv/shared;yes;no;no;$TEST_USER" \
+    -s "Public;/srv/public;yes;no;yes" >/dev/null
+for _ in $(seq 30); do
+    (exec 3<>"/dev/tcp/127.0.0.1/$PORT") 2>/dev/null && break
+    sleep 1
+done
+sleep 2
+
+sudo -v
+
+common=(--uid "$UID_SELF" --host 127.0.0.1 --port "$PORT")
+
+check "wrong password" "10||EAUTH" "$(helper wrong mount "${common[@]}" --share Shared --user "$TEST_USER")"
+check "no mount point left after failure" "absent" "$([[ -e $BASE/127.0.0.1/Shared ]] && echo present || echo absent)"
+check "missing share" "11||ENOSHARE" "$(helper "$TEST_PASSWORD" mount "${common[@]}" --share Nope --user "$TEST_USER")"
+check "mount" "0|OK|" "$(helper "$TEST_PASSWORD" mount "${common[@]}" --share Shared --user "$TEST_USER")"
+check "mount again is ALREADY" "0|ALREADY|" "$(helper "$TEST_PASSWORD" mount "${common[@]}" --share shared --user "$TEST_USER")"
+check "guest mount" "0|OK|" "$(helper "" mount "${common[@]}" --share Public --guest)"
+
+mountpoint="$BASE/127.0.0.1/Shared"
+check "user owns the files" "$UID_SELF" "$(stat -c %u "$mountpoint")"
+echo "written by the test" > "$mountpoint/test-file.txt"
+check "write and read back" "written by the test" "$(cat "$mountpoint/test-file.txt")"
+check "user folder is 0700 root" "700 0" "$(sudo stat -c '%a %u' "$BASE")"
+check "user ACL" "user:$UID_SELF:r-x" "$(sudo getfacl -p "$BASE" 2>/dev/null | grep "^user:$UID_SELF:")"
+check "other users cannot list" "denied" "$(sudo -u nobody ls "$BASE" >/dev/null 2>&1 && echo allowed || echo denied)"
+vers=$(sed -n "s|.* $mountpoint .* - cifs .*vers=\([0-9.]*\).*|\1|p" /proc/self/mountinfo)
+check "SMB 2.1 or later negotiated" "yes" "$([[ $vers =~ ^(2\.1|3) ]] && echo yes || echo "no ($vers)")"
+
+exec 4<"$mountpoint/test-file.txt"
+(cd "$mountpoint" && sleep 30) &
+holder=$!
+sleep 1
+check "busy share refuses plain unmount" "14||EBUSY" "$(helper "" unmount --uid "$UID_SELF" --path "$mountpoint")"
+kill "$holder" 2>/dev/null || true
+wait "$holder" 2>/dev/null || true
+exec 4<&-
+check "unmount" "0|UNMOUNTED|" "$(helper "" unmount --uid "$UID_SELF" --path "$mountpoint")"
+check "mount point removed" "absent" "$([[ -e $mountpoint ]] && echo present || echo absent)"
+check "unmount when not mounted" "15||ENOTMOUNTED" "$(helper "" unmount --uid "$UID_SELF" --path "$mountpoint")"
+check "path outside the tree refused" "3||EINVALID" "$(helper "" unmount --uid "$UID_SELF" --path /etc)"
+status=0
+sudo PKEXEC_UID=$((UID_SELF + 1)) "$HELPER" unmount --uid "$UID_SELF" --path "$mountpoint" \
+    </dev/null >/dev/null 2>"$TMP/err" || status=$?
+check "other uid refused under pkexec rules" "17|EPERMS" "$status|$(cut -f1 < "$TMP/err")"
+
+check "mount for stale test" "0|OK|" "$(helper "$TEST_PASSWORD" mount "${common[@]}" --share Shared --user "$TEST_USER")"
+"$engine" stop -t 1 "$NAME" >/dev/null
+check "stale server: forced unmount" "0|UNMOUNTED|" "$(helper "" unmount --uid "$UID_SELF" --path "$mountpoint" --lazy)"
+check "server gone: reported" "12||EHOST" "$(helper "$TEST_PASSWORD" mount "${common[@]}" --share Shared --user "$TEST_USER")"
+
+check "unmount-all leaves an empty tree" "" "$(sudo "$HELPER" unmount-all --uid "$UID_SELF" >/dev/null 2>&1; sudo find "$BASE" -mindepth 1 2>/dev/null)"
+
+echo "passed $PASSED, failed $FAILED"
+(( FAILED == 0 ))
+
+# End of File #

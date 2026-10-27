@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Service
+MimeType=inode/directory;
+X-KDE-Protocols=file
+X-KDE-Submenu=Fast share mount
+Actions=unmount;
+
+[Desktop Action unmount]
+Name=Unmount fast share mount
+Icon=media-eject
+Exec="@BIN@" unmount --gui %U
+
+# End of File #

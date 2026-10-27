@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<policyconfig>
+  <vendor>Dolphin-Fast-Share-Mount</vendor>
+  <vendor_url>https://github.com/RedBearAK/Dolphin-Fast-Share-Mount</vendor_url>
+  <icon_name>folder-network</icon_name>
+
+  <action id="io.github.redbearak.dolphin-fast-share-mount.mount">
+    <description>Mount or unmount a network share as a kernel CIFS mount</description>
+    <message>Authentication is required to mount or unmount a network share for fast access</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">@HELPER@</annotate>
+  </action>
+</policyconfig>
+<!-- End of File -->
