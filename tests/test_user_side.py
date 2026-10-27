@@ -717,6 +717,27 @@ class MountFlowTests(unittest.TestCase):
         self.assertEqual(app.mount_one(fsm.parse_smb_url("smb://nas/Media")), 0)
         fsm.PasswordStore.return_value.put.assert_called_once_with("kris@nas", "right")
 
+    def test_remember_is_asked_before_the_root_prompt_and_only_once(self):
+        events = []
+        ui = FakeUI(passwords=["typo", "right"], yes=True)
+        ui.ask_password = lambda prompt: events.append("password") or ui.passwords.pop(0)
+        ui.ask_yes_no = lambda question: events.append("remember?") or True
+        app = self.app(ui, helper_results=[self.denied(), self.ok()])
+        helper_results = list(app.elevator.run_helper.side_effect)
+        app.elevator.run_helper.side_effect = lambda *a: events.append("root") or helper_results.pop(0)
+        fsm.PasswordStore.return_value.kind = "kwallet"
+        fsm.PasswordStore.return_value.get.return_value = None
+        self.assertEqual(app.mount_one(fsm.parse_smb_url("smb://nas/Media")), 0)
+        self.assertEqual(events, ["password", "remember?", "root", "password", "root"])
+        fsm.PasswordStore.return_value.put.assert_called_once_with("kris@nas", "right")
+
+    def test_no_is_respected_and_nothing_is_saved(self):
+        app = self.app(FakeUI(passwords=["right"], yes=False), helper_results=[self.ok()])
+        fsm.PasswordStore.return_value.kind = "kwallet"
+        fsm.PasswordStore.return_value.get.return_value = None
+        self.assertEqual(app.mount_one(fsm.parse_smb_url("smb://nas/Media")), 0)
+        fsm.PasswordStore.return_value.put.assert_not_called()
+
     def test_port_139_is_tried_when_445_is_closed(self):
         app = self.app(FakeUI(passwords=["pw"]), helper_results=[self.ok()])
         with mock.patch.object(fsm, "tcp_probe", side_effect=["connection refused on port 445", None]):

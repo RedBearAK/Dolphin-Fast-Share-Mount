@@ -1053,6 +1053,19 @@ class App:
         store = PasswordStore(self.log)
         key = wallet_key(user, ref.host, domain)
         password, prompted = None, False
+        # Asked right after the password, before the root prompt; the
+        # password is saved only once the mount has proved it right.
+        remember = None
+
+        def decide_remember():
+            nonlocal remember
+            if remember is not None or not store.kind:
+                return
+            setting = self.config["remember_password"]
+            wallet = "KWallet" if store.kind == "kwallet" else "the keyring"
+            remember = setting == "always" or (setting == "ask" and self.ui.ask_yes_no(
+                f"Remember the password for {key} in {wallet} if the mount works?"))
+
         if not guest:
             password = store.get(key) if store.kind else None
             if password is None:
@@ -1061,6 +1074,7 @@ class App:
                 if password is None:
                     self.ui.notify("Cancelled", f"No password given for {key}.")
                     return 1
+                decide_remember()
 
         for attempt in range(3):
             if password is not None and len(password.encode("utf-8", "surrogateescape")) > 512:
@@ -1075,6 +1089,7 @@ class App:
             prompted = True
             if password is None:
                 break
+            decide_remember()
 
         if not result.ok:
             title, body = explain(result, ref, "" if guest else user)
@@ -1087,12 +1102,9 @@ class App:
             self.ui.error("Mount failed", f"The helper reported {state} but {mountpoint or '?'} "
                           f"does not answer.")
             return 1
-        if prompted and password is not None and store.kind and state == "OK":
-            remember = self.config["remember_password"]
-            if remember == "always" or (remember == "ask" and self.ui.ask_yes_no(
-                    f"Remember the password for {key} ({'KWallet' if store.kind == 'kwallet' else 'keyring'})?")):
-                if not store.put(key, password):
-                    self.ui.notify("Password not saved", f"Could not save the password for {key}.")
+        if prompted and password is not None and remember and state == "OK":
+            if not store.put(key, password):
+                self.ui.notify("Password not saved", f"Could not save the password for {key}.")
         if state == "ALREADY":
             self.ui.notify("Already mounted", f"{ref.source} is already mounted at {mountpoint}.")
         else:
