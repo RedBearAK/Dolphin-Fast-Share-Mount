@@ -35,8 +35,25 @@ engine=$(command -v podman || command -v docker || true)
 [[ -n $engine ]] || { echo "podman or docker is needed"; exit 2; }
 [[ -x /usr/sbin/mount.cifs || -x /sbin/mount.cifs ]] || { echo "cifs-utils is needed"; exit 2; }
 
+# Mount points of this user's tool mounts, one per line; with an argument,
+# only those below that folder. The test touches only its own mounts (below
+# $BASE/127.0.0.1): the user may have real shares mounted by the tool, and
+# unmount-all would take them away (it once detached a running copy).
+tool_mounts() {
+    local under=${1:-$BASE} target
+    awk '{ print $5 }' /proc/self/mountinfo | while IFS= read -r target; do
+        target=$(printf '%b' "$target")
+        if [[ $target == "$under/"* ]]; then
+            printf '%s\n' "$target"
+        fi
+    done
+}
+
 cleanup() {
-    sudo "$HELPER" unmount-all --uid "$UID_SELF" --lazy >/dev/null 2>&1 || true
+    local target
+    while IFS= read -r target; do
+        sudo "$HELPER" unmount --uid "$UID_SELF" --path "$target" --lazy >/dev/null 2>&1 || true
+    done < <(tool_mounts "$BASE/127.0.0.1")
     "$engine" rm -f "$NAME" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
@@ -109,6 +126,10 @@ printf "%s\n%s\n" "$2" "$2" | smbpasswd -s -a "$1"
 cp /usr/sbin/smbd /usr/local/bin/test-smbd
 exec /usr/local/bin/test-smbd -FS --no-process-group </dev/null'
 
+existing=$(tool_mounts | grep -c . || true)
+if (( existing > 0 )); then
+    echo "Leaving your $existing share(s) mounted by the tool alone; the test uses $BASE/127.0.0.1 only."
+fi
 echo "Starting Samba ($IMAGE) on 127.0.0.1:$PORT"
 "$engine" rm -f "$NAME" >/dev/null 2>&1 || true
 "$engine" run -d --rm --name "$NAME" -p "127.0.0.1:$PORT:445" --entrypoint /bin/sh \
@@ -184,7 +205,17 @@ check "mount for stale test" "0|OK|" "$(helper "$TEST_PASSWORD" mount "${common[
 check "stale server: forced unmount" "0|UNMOUNTED|" "$(helper "" unmount --uid "$UID_SELF" --path "$mountpoint" --lazy)"
 check "server gone: reported" "12||EHOST" "$(helper "$TEST_PASSWORD" mount "${common[@]}" --share Shared --user "$TEST_USER")"
 
-check "unmount-all leaves an empty tree" "" "$(sudo "$HELPER" unmount-all --uid "$UID_SELF" --lazy >/dev/null 2>&1; sudo find "$BASE" -mindepth 1 2>/dev/null)"
+# unmount-all acts on every one of this user's mounts, so it is only tried
+# when the user has none besides the test's.
+others=$(tool_mounts | grep -v -c -F "$BASE/127.0.0.1/" || true)
+if (( others == 0 )); then
+    check "unmount-all leaves an empty tree" "" \
+        "$(sudo "$HELPER" unmount-all --uid "$UID_SELF" --lazy >/dev/null 2>&1; sudo find "$BASE" -mindepth 1 2>/dev/null)"
+else
+    echo "skip  unmount-all: it would also unmount your $others other share(s) mounted by the tool"
+    cleanup
+    check "test mounts removed" "" "$(tool_mounts "$BASE/127.0.0.1")"
+fi
 
 echo "passed $PASSED, failed $FAILED"
 (( FAILED == 0 ))

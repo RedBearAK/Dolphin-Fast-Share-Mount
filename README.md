@@ -201,7 +201,7 @@ tests/run.sh
 
 runs `bash -n`, `shellcheck` (when installed) and the unit tests (Python `unittest`, no other dependencies). The helper's functions are tested by sourcing it into bash, and its mount command runs against a stub `mount.cifs`, so none of this needs root.
 
-`tests/integration/samba-test.sh` mounts real shares from a Samba container (podman or docker) and needs `cifs-utils` and sudo. GitHub Actions runs both.
+`tests/integration/samba-test.sh` mounts real shares from a Samba container (podman or docker) and needs `cifs-utils` and sudo. It touches only its own mounts (below `/run/dolphin-fast-share-mount/<uid>/127.0.0.1`), so shares you have mounted with the tool stay mounted; its `unmount-all` check is skipped while you have any. GitHub Actions runs both.
 
 ## Licence
 
