@@ -17,7 +17,6 @@ SPDX-License-Identifier: GPL-3.0-or-later
 """
 
 import argparse
-import fcntl
 import functools
 import getpass
 import os
@@ -237,7 +236,7 @@ def parse_config(text: str) -> tuple:
 def load_config() -> tuple:
     path = config_path()
     try:
-        with open(path, encoding="utf-8") as handle:
+        with open(path, encoding="utf-8", errors="replace") as handle:
             return parse_config(handle.read())
     except FileNotFoundError:
         return dict(DEFAULT_CONFIG), []
@@ -266,9 +265,12 @@ class Log:
         if level == "debug" and not self.debug_enabled:
             return
         message = redact(message).replace("\n", " | ")
+        # Names from the mount table or the command line may hold bytes that
+        # are not UTF-8 (kept as surrogates); write them as escapes.
+        message = message.encode("utf-8", "backslashreplace").decode("utf-8")
         try:
             syslog.syslog(self.PRIORITIES[level], message)
-        except OSError:
+        except (OSError, ValueError):
             pass
         try:
             os.makedirs(os.path.dirname(self.path), mode=0o700, exist_ok=True)
@@ -434,7 +436,8 @@ def tcp_probe(host: str, port: int, timeout: float = PROBE_TIMEOUT) -> str | Non
 def path_responds(path: str, timeout: int = PROBE_TIMEOUT) -> bool:
     """stat in a child process, so a dead server cannot hang this program."""
     try:
-        result = subprocess.run(["timeout", str(timeout), "stat", "--", path],
+        result = subprocess.run([which("timeout") or "/usr/bin/timeout", str(timeout),
+                                 which("stat") or "/usr/bin/stat", "--", path],
                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                 stderr=subprocess.DEVNULL, timeout=timeout + 5, check=False)
         return result.returncode == 0
@@ -453,14 +456,22 @@ def which(name: str) -> str | None:
 
 def run(argv: list, input_text: str | None = None, timeout: int = 30,
         env: dict | None = None) -> subprocess.CompletedProcess:
+    """Run a program found by which() (a bare name is never left to PATH)."""
+    program = argv[0] if os.path.isabs(argv[0]) else which(argv[0])
+    if program is None:
+        return subprocess.CompletedProcess(argv, 127, "", f"{argv[0]}: not found")
     try:
-        return subprocess.run(argv, input=input_text, capture_output=True, text=True,
-                              timeout=timeout, env=env, check=False,
+        return subprocess.run([program, *argv[1:]], input=input_text, capture_output=True,
+                              text=True, errors="replace", timeout=timeout, env=env, check=False,
                               stdin=None if input_text is not None else subprocess.DEVNULL)
     except FileNotFoundError:
         return subprocess.CompletedProcess(argv, 127, "", f"{argv[0]}: not found")
     except subprocess.TimeoutExpired:
         return subprocess.CompletedProcess(argv, 124, "", f"{argv[0]}: timed out")
+    except PermissionError:
+        # A program running as root (the helper under pkexec) cannot be
+        # stopped by this user when its time runs out.
+        return subprocess.CompletedProcess(argv, 124, "", f"{argv[0]}: timed out, still running")
 
 
 class UI:
@@ -861,13 +872,6 @@ class App:
 
     # -- shared pieces --
 
-    def lock(self):
-        runtime = os.environ.get("XDG_RUNTIME_DIR") or state_dir()
-        os.makedirs(runtime, mode=0o700, exist_ok=True)
-        handle = open(os.path.join(runtime, f"{APP_ID}.lock"), "w", encoding="utf-8")
-        fcntl.flock(handle, fcntl.LOCK_EX)
-        return handle
-
     def helper_or_error(self) -> str | None:
         helper, problem = find_helper()
         if helper is None:
@@ -914,9 +918,10 @@ class App:
                 continue
             if all(ref.key != other.key for other in refs):
                 refs.append(ref)
-        with self.lock():
-            for ref in refs:
-                status = max(status, self.mount_one(ref))
+        # No lock here: the helper serialises a user's mounts itself, and a
+        # lock held across dialogs would make every other request wait.
+        for ref in refs:
+            status = max(status, self.mount_one(ref))
         return status
 
     def mount_one(self, ref: ShareRef) -> int:
@@ -960,8 +965,9 @@ class App:
             self.log.info(f"{entry.source} at {entry.target} is not usable by this user; "
                           f"mounting a separate copy")
 
-        port = ref.port or 445
-        problem = tcp_probe(ref.host, port)
+        problem = tcp_probe(ref.host, ref.port or 445)
+        if problem is not None and ref.port is None and tcp_probe(ref.host, 139) is None:
+            problem = None
         if problem is not None:
             self.ui.error("Server not reachable", f"Server {ref.host} not reachable: {problem}.")
             return 1
@@ -1020,7 +1026,7 @@ class App:
             self.ui.error("Mount failed", f"The helper reported {state} but {mountpoint or '?'} "
                           f"does not answer.")
             return 1
-        if prompted and password is not None and store.kind:
+        if prompted and password is not None and store.kind and state == "OK":
             remember = self.config["remember_password"]
             if remember == "always" or (remember == "ask" and self.ui.ask_yes_no(
                     f"Remember the password for {key} ({'KWallet' if store.kind == 'kwallet' else 'keyring'})?")):
@@ -1076,56 +1082,62 @@ class App:
         return 0
 
     def cmd_unmount(self) -> int:
-        with self.lock():
-            entries = read_mounts()
-            if self.args.all:
-                own = [e for e in cifs_mounts(entries) if is_own_mount(e, self.uid)]
-                if not own:
-                    self.ui.notify("Nothing to unmount", f"No {APP_NAME} mounts are active.")
-                    return 0
-                helper = self.helper_or_error()
-                if helper is None:
-                    return 1
-                args = ["unmount-all", "--uid", str(self.uid)] + (["--lazy"] if self.args.force else [])
-                result = self.elevator.run_helper(helper, args)
-                if not result.ok:
-                    self.ui.error("Unmount failed", f"{result.message}. {result.detail}".strip())
-                    return 1
-                self.ui.notify("Unmounted", f"{len(result.lines)} share(s) unmounted.")
+        entries = read_mounts()
+        if self.args.all:
+            own = [e for e in cifs_mounts(entries) if is_own_mount(e, self.uid)]
+            if not own:
+                self.ui.notify("Nothing to unmount", f"No {APP_NAME} mounts are active.")
                 return 0
-            if not self.args.targets:
-                self.ui.error("Nothing to unmount", "Give a path, an smb:// address or --all.")
-                return 2
-            status, done = 0, set()
-            for text in self.args.targets:
-                try:
-                    entry, label = self.resolve_target(text, entries)
-                except UsageError as error:
-                    self.ui.error("Cannot unmount", str(error))
-                    status = 2
-                    continue
-                if entry is None:
-                    self.ui.notify("Not a fast share mount", f"{label} is not on a "
-                                   f"{APP_NAME} mount; nothing to unmount.")
-                    continue
-                if not is_own_mount(entry, self.uid):
-                    self.ui.error("Not a fast share mount", f"{label} is on {entry.source}, "
-                                  f"mounted at {entry.target} by something else "
-                                  f"(fstab, Smb4K or a manual mount). Leaving it alone.")
-                    status = max(status, 1)
-                    continue
-                if entry.target in done:
-                    continue
-                done.add(entry.target)
-                status = max(status, self.unmount_entry(entry, self.args.force))
-            return status
+            helper = self.helper_or_error()
+            if helper is None:
+                return 1
+            args = ["unmount-all", "--uid", str(self.uid)] + (["--lazy"] if self.args.force else [])
+            result = self.elevator.run_helper(helper, args)
+            if not result.ok:
+                self.ui.error("Unmount failed", f"{result.message}. {result.detail}".strip())
+                return 1
+            self.ui.notify("Unmounted", f"{len(result.lines)} share(s) unmounted.")
+            return 0
+        if not self.args.targets:
+            self.ui.error("Nothing to unmount", "Give a path, an smb:// address or --all.")
+            return 2
+        status, done = 0, set()
+        for text in self.args.targets:
+            try:
+                entry, label = self.resolve_target(text, entries)
+            except UsageError as error:
+                self.ui.error("Cannot unmount", str(error))
+                status = 2
+                continue
+            if entry is None:
+                self.ui.notify("Not a fast share mount", f"{label} is not on a "
+                               f"{APP_NAME} mount; nothing to unmount.")
+                continue
+            if entry.target.startswith(MOUNT_BASE + "/") and not is_own_mount(entry, self.uid):
+                self.ui.error("Not your mount", f"{label} belongs to another user's "
+                              f"{APP_NAME} mount. Leaving it alone.")
+                status = max(status, 1)
+                continue
+            if not is_own_mount(entry, self.uid):
+                self.ui.error("Not a fast share mount", f"{label} is on {entry.source}, "
+                              f"mounted at {entry.target} by something else "
+                              f"(fstab, Smb4K or a manual mount). Leaving it alone.")
+                status = max(status, 1)
+                continue
+            if entry.target in done:
+                continue
+            done.add(entry.target)
+            status = max(status, self.unmount_entry(entry, self.args.force))
+        return status
 
     # -- list --
 
     def cmd_list(self) -> int:
         entries = cifs_mounts(read_mounts())
         own = [e for e in entries if is_own_mount(e, self.uid)]
-        other = [e for e in entries if not is_own_mount(e, self.uid)]
+        other = [e for e in entries if not e.target.startswith(MOUNT_BASE + "/")]
+        others_of_tool = sum(1 for e in entries if e.target.startswith(MOUNT_BASE + "/")
+                             and not is_own_mount(e, self.uid))
         print(f"{APP_NAME} mounts:")
         if not own:
             print("  (none)")
@@ -1137,8 +1149,9 @@ class App:
         if not other:
             print("  (none)")
         for entry in other:
-            mark = " (another user's fast share mount)" if entry.target.startswith(MOUNT_BASE + "/") else ""
-            print(f"  {entry.source}  ->  {entry.target}{mark}")
+            print(f"  {entry.source}  ->  {entry.target}")
+        if others_of_tool:
+            print(f"  ({others_of_tool} {APP_NAME} mount(s) of other users, not shown)")
         return 0
 
     # -- check --
@@ -1212,7 +1225,7 @@ class App:
         plasma = os.environ.get("KDE_SESSION_VERSION", "")
         shell = which("plasmashell")
         detail = run([shell, "--version"], timeout=10).stdout.strip() if shell else ""
-        row("Plasma", plasma or "?", detail or "plasmashell not found"
+        row("Plasma", plasma or "?", (detail or "plasmashell not found")
             + ("; Plasma 5 older than 5.22 (KF 5.85) is not supported" if plasma == "5" else ""))
         release = os_release()
         row("System", release.get("PRETTY_NAME", "?"), f"package manager: {package_manager() or '?'}")
@@ -1290,6 +1303,11 @@ def main(argv: list | None = None) -> int:
     if os.geteuid() == 0:
         print(f"{COMMAND}: run this as your desktop user, not as root.", file=sys.stderr)
         return 2
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="backslashreplace")
+        except (AttributeError, ValueError):
+            pass
     app = App(args)
     try:
         return {"mount": app.cmd_mount, "unmount": app.cmd_unmount, "list": app.cmd_list,

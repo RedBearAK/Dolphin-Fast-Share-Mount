@@ -19,7 +19,8 @@ from support import FIXTURES, HELPER, load_user_side
 
 user_side = load_user_side()
 
-# logger is replaced so tests do not write to the system journal.
+# logger is replaced so the sourced-function tests do not write to the system
+# journal. CommandLineTests runs the helper as a program, which does log.
 PRELUDE = 'source "$HELPER"; logger() { :; }; '
 
 
@@ -274,13 +275,15 @@ class MountFlowTests(unittest.TestCase):
             'require_root() { :; }; '
             'check_target_uid() { TARGET_GID=100; }; '
             'ensure_root_dir() { mkdir -p -- "$1"; }; '
-            'ensure_user_root() { mkdir -p -- "$MOUNT_BASE/$1"; }; '
+            'ensure_user_root() { mkdir -p -- "$MOUNT_BASE/$1"; : > "$STUB_DIR/acl-set"; }; '
             'kernel_cifs_lines() { printf "%s" "$KERNEL"; }; '
             + extra +
             'cmd_mount "$@"'
         )
         env = {"BASE": self.base, "STUB_DIR": self.stub_dir, "STUB_MOUNTINFO": self.mountinfo,
-               "STUB_MODE": mode, "KERNEL": kernel}
+               "STUB_MODE": mode, "KERNEL": kernel,
+               # Set by a careless caller; mount.cifs prefers them over PASSWD_FD.
+               "PASSWD": "leaked-from-env", "PASSWD_FILE": "/etc/shadow"}
         return bash(script, *args, stdin=stdin, env=env)
 
     def read(self, name):
@@ -304,9 +307,11 @@ class MountFlowTests(unittest.TestCase):
             self.assertIn(expected, options)
         self.assertNotIn(secret, self.read("argv"))
         self.assertFalse(any(o.startswith(("password", "pass=")) for o in options))
-        env = self.read("env")
-        self.assertNotIn(secret, env)
-        self.assertNotIn("PASSWD=", env)
+        env = self.read("env").splitlines()
+        self.assertFalse(any(secret in line for line in env))
+        self.assertFalse(any(line.startswith(("PASSWD=", "PASSWD_FILE=")) for line in env))
+        self.assertTrue(os.path.exists(os.path.join(self.stub_dir, "acl-set")),
+                        "cmd_mount did not set up the user's folder")
 
     def test_guest_reads_no_password(self):
         result = self.mount("--uid", "1000", "--host", "nas", "--share", "Public", "--guest",
@@ -462,6 +467,16 @@ class UnmountTests(unittest.TestCase):
                       'remove_if_empty() { :; }; unmount_one /x 1')
         self.assertIn("umount -l -- /x", result.stdout)
 
+    def test_path_outside_the_tree_is_refused(self):
+        for path in ("/etc", "/run/dolphin-fast-share-mount/1000/nas",
+                     "/run/dolphin-fast-share-mount/1000/../1001/nas/x"):
+            with self.subTest(path=path):
+                result = bash('require_root() { :; }; check_target_uid() { :; }; '
+                              'umount() { echo "UMOUNT CALLED" >&2; }; '
+                              'cmd_unmount --uid 1000 --path "$1"', path)
+                self.assertEqual(result.returncode, 3)
+                self.assertNotIn("UMOUNT CALLED", result.stderr)
+
     def test_not_mounted(self):
         with tempfile.TemporaryDirectory() as folder:
             path = f"{folder}/1000/nas/x"
@@ -490,6 +505,8 @@ class UnmountTests(unittest.TestCase):
 class KernelLineTests(unittest.TestCase):
     def test_other_servers_are_left_out(self):
         lines = ("CIFS: VFS: \\\\otherbox Send error in SessSetup = -13\n"
+                 "CIFS: VFS: \\\\nas-hr.example Send error in SessSetup = -13\n"
+                 "CIFS: Attempting to mount //hr-secrets.example/Payroll\n"
                  "CIFS: VFS: \\\\NAS Dialect not supported\n"
                  "CIFS: VFS: cifs_mount failed w/return code = -112\n"
                  "usb 1-1: new device\n")
@@ -499,6 +516,23 @@ class KernelLineTests(unittest.TestCase):
             "CIFS: VFS: \\\\NAS Dialect not supported",
             "CIFS: VFS: cifs_mount failed w/return code = -112",
         ])
+
+
+class LockTests(unittest.TestCase):
+    def test_second_run_waits_and_gives_up(self):
+        import fcntl
+        with tempfile.TemporaryDirectory() as folder:
+            os.makedirs(f"{folder}/1000")
+            handle = os.open(f"{folder}/1000", os.O_RDONLY)
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX)
+                result = bash('MOUNT_BASE="$1"; LOCK_WAIT=1; lock_user_root 1000', folder)
+            finally:
+                os.close(handle)
+            self.assertEqual(result.returncode, 14)
+            self.assertIn("still running", result.stderr)
+            free = bash('MOUNT_BASE="$1"; LOCK_WAIT=1; lock_user_root 1000', folder)
+            self.assertEqual(free.returncode, 0, free.stderr)
 
 
 if __name__ == "__main__":

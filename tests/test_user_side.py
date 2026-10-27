@@ -3,6 +3,7 @@
 SPDX-License-Identifier: GPL-3.0-or-later
 """
 
+import io
 import os
 import subprocess
 import sys
@@ -211,6 +212,41 @@ class HelperTrustTests(unittest.TestCase):
                 self.assertNotEqual(fsm.which("pkexec"), fake)
                 self.assertNotIn(fake, str(fsm.Elevator(mock.Mock()).methods("/x")))
 
+    def test_owner_and_folder_checks(self):
+        helper = "/opt/test/fast-share-mount-helper"
+        real_lstat = os.lstat
+
+        def fake(file_uid, folder_uid):
+            def lstat(path):
+                if path == helper:
+                    return os.stat_result((0o100755, 0, 0, 1, file_uid, 0, 0, 0, 0, 0))
+                if path == "/opt/test":
+                    return os.stat_result((0o040755, 0, 0, 1, folder_uid, 0, 0, 0, 0, 0))
+                return real_lstat(path)
+            return lstat
+
+        with mock.patch.object(fsm.os.path, "realpath", side_effect=lambda p: p):
+            with mock.patch.object(fsm.os, "lstat", side_effect=fake(1000, 0)):
+                self.assertTrue(fsm.is_root_secure(helper).startswith(helper))
+            with mock.patch.object(fsm.os, "lstat", side_effect=fake(0, 1000)):
+                self.assertTrue(fsm.is_root_secure(helper).startswith("/opt/test can be changed"))
+            if os.stat("/opt").st_uid == 0 and not os.stat("/opt").st_mode & 0o022:
+                with mock.patch.object(fsm.os, "lstat", side_effect=fake(0, 0)):
+                    self.assertIsNone(fsm.is_root_secure(helper))
+
+    def test_run_never_leaves_a_name_to_path(self):
+        with tempfile.TemporaryDirectory() as folder:
+            fake = os.path.join(folder, "fsm-only-in-path")
+            with open(fake, "w", encoding="utf-8") as handle:
+                handle.write("#!/bin/sh\necho FAKE\n")
+            os.chmod(fake, 0o755)
+            with mock.patch.dict(os.environ, {"PATH": folder}):
+                self.assertEqual(fsm.run(["fsm-only-in-path"]).returncode, 127)
+                with mock.patch.object(fsm.subprocess, "run") as called:
+                    fsm.run(["true"])
+                self.assertEqual(called.call_args.args[0][0], fsm.which("true"))
+                self.assertTrue(os.path.isabs(called.call_args.args[0][0]))
+
     def test_symlink_is_refused(self):
         with tempfile.TemporaryDirectory() as folder:
             link = os.path.join(folder, "helper")
@@ -305,6 +341,46 @@ class CommandLineTests(unittest.TestCase):
             self.assertEqual(handle.readline(), "#!/usr/bin/python3 -I\n")
 
 
+class OutputTests(unittest.TestCase):
+    def test_list_hides_other_users_tool_mounts(self):
+        with open(os.path.join(FIXTURES, "mountinfo.txt"), encoding="utf-8") as handle:
+            entries = fsm.parse_mountinfo(handle.read())
+        with tempfile.TemporaryDirectory() as home, \
+                mock.patch.dict(os.environ, {"HOME": home, "XDG_STATE_HOME": home,
+                                             "XDG_CONFIG_HOME": home}), \
+                mock.patch.object(fsm.syslog, "syslog"), \
+                mock.patch.object(fsm.os, "getuid", return_value=1000), \
+                mock.patch.object(fsm, "read_mounts", return_value=entries), \
+                mock.patch.object(fsm, "path_responds", return_value=True), \
+                mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            self.assertEqual(fsm.main(["list"]), 0)
+        text = out.getvalue()
+        self.assertIn("//nas/My Share", text)
+        self.assertIn("/mnt/media", text)
+        self.assertNotIn("Private", text)
+        self.assertNotIn("/1001/", text)
+        self.assertIn("2 Fast Share Mount mount(s) of other users, not shown", text)
+
+    def test_non_utf8_names_do_not_crash(self):
+        with tempfile.TemporaryDirectory() as home:
+            config = os.path.join(home, "config")
+            os.makedirs(config)
+            with open(os.path.join(config, "dolphin-fast-share-mount.conf"), "wb") as handle:
+                handle.write(b"user=j\xf6rg\n")
+            env = {"HOME": home, "PATH": "/usr/bin:/bin", "LANG": "C.UTF-8",
+                   "XDG_RUNTIME_DIR": home, "XDG_STATE_HOME": os.path.join(home, "state"),
+                   "XDG_CONFIG_HOME": config, "DBUS_SESSION_BUS_ADDRESS": "unix:path=/nonexistent",
+                   "FAST_SHARE_MOUNT_MOUNTINFO": "/dev/null"}
+            result = subprocess.run([os.fsencode(USER_SIDE), b"unmount", b"/tmp/caf\xe9"],
+                                    capture_output=True, env=env, stdin=subprocess.DEVNULL,
+                                    timeout=60, check=False)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(b"nothing to unmount", result.stderr)
+            listed = subprocess.run([USER_SIDE, "list"], capture_output=True, env=env,
+                                    stdin=subprocess.DEVNULL, timeout=60, check=False)
+            self.assertEqual(listed.returncode, 0, listed.stderr)
+
+
 class FakeUI:
     def __init__(self, passwords=(), yes=False):
         self.passwords = list(passwords)
@@ -354,7 +430,8 @@ class MountFlowTests(unittest.TestCase):
         self.addCleanup(self.responds.stop)
 
     def app(self, ui, mounts=(), helper_results=()):
-        args = fsm.build_parser().parse_args(["mount", "--no-open", "smb://nas/Media/Films"])
+        args = fsm.build_parser().parse_args(["mount", "--no-open", "--user", "kris",
+                                              "smb://nas/Media/Films"])
         app = fsm.App(args)
         app.ui = ui
         app.opened = []
@@ -426,14 +503,35 @@ class MountFlowTests(unittest.TestCase):
         app.elevator.run_helper.assert_not_called()
         self.assertIn("connection refused", app.ui.errors[0][1])
 
-    def test_password_over_512_bytes_is_refused(self):
-        app = self.app(FakeUI(passwords=["é" * 257]))
+    def test_password_limit_is_512_bytes(self):
+        app = self.app(FakeUI(passwords=["é" * 256]), helper_results=[self.ok()])
+        self.assertEqual(app.mount_one(fsm.parse_smb_url("smb://nas/Media")), 0)
+        app.elevator.run_helper.assert_called_once()
+        app = self.app(FakeUI(passwords=["é" * 256 + "a"]))
         self.assertEqual(app.mount_one(fsm.parse_smb_url("smb://nas/Media")), 1)
         app.elevator.run_helper.assert_not_called()
         self.assertEqual(app.ui.errors[0][0], "Password too long")
 
+    def test_password_is_saved_only_after_a_real_login(self):
+        already = fsm.HelperResult(True, [["ALREADY", OWN, "3.1.1"]])
+        app = self.app(FakeUI(passwords=["typo"], yes=True), helper_results=[already])
+        fsm.PasswordStore.return_value.kind = "kwallet"
+        fsm.PasswordStore.return_value.get.return_value = None
+        self.assertEqual(app.mount_one(fsm.parse_smb_url("smb://nas/Media")), 0)
+        fsm.PasswordStore.return_value.put.assert_not_called()
+        app = self.app(FakeUI(passwords=["right"], yes=True), helper_results=[self.ok()])
+        self.assertEqual(app.mount_one(fsm.parse_smb_url("smb://nas/Media")), 0)
+        fsm.PasswordStore.return_value.put.assert_called_once_with("kris@nas", "right")
+
+    def test_port_139_is_tried_when_445_is_closed(self):
+        app = self.app(FakeUI(passwords=["pw"]), helper_results=[self.ok()])
+        with mock.patch.object(fsm, "tcp_probe", side_effect=["connection refused on port 445", None]):
+            self.assertEqual(app.mount_one(fsm.parse_smb_url("smb://nas/Media")), 0)
+        app.elevator.run_helper.assert_called_once()
+
     def test_guest_sends_no_password(self):
         app = self.app(FakeUI(), helper_results=[self.ok()])
+        app.args.user = None
         self.assertEqual(app.mount_one(fsm.parse_smb_url("smb://guest@nas/Media")), 0)
         args, password = app.elevator.run_helper.call_args.args[1:3]
         self.assertIn("--guest", args)

@@ -154,6 +154,8 @@ class UserPartTests(unittest.TestCase):
         result = self.uninstall()
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
         self.assertEqual(all_files(self.home), [])
+        self.assertIn("Nothing to unmount", result.stderr, "the command's unmount --all did not run")
+        self.assertIn("No saved passwords were removed", result.stdout, "forget --all did not run")
         again = self.uninstall()
         self.assertEqual(again.returncode, 0, again.stderr + again.stdout)
 
@@ -191,6 +193,16 @@ class UserPartTests(unittest.TestCase):
         result = self.script(INSTALLER, "--user-only")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("characters this installer does not handle", result.stderr)
+
+    def test_busy_share_stops_the_user_only_uninstall(self):
+        self.install()
+        with open(self.command, "w", encoding="utf-8") as handle:
+            handle.write("#!/bin/sh\n[ \"$1\" = unmount ] && { echo busy >&2; exit 1; }\nexit 0\n")
+        before = all_files(self.home)
+        result = self.uninstall()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("nothing was removed", result.stderr)
+        self.assertEqual(all_files(self.home), before)
 
     def test_uninstall_keep_config(self):
         self.install()
@@ -244,6 +256,47 @@ class SystemPartTests(unittest.TestCase):
         result = self.script(UNINSTALLER, "--system-only")
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
         self.assertEqual(all_files(self.dest), [])
+
+    def test_manifest_lists_installed_paths_not_staged_ones(self):
+        result = self.script(INSTALLER, "--system-only")
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        with open(os.path.join(self.dest, f"usr/local/share/{APP_ID}/installed-files.txt"),
+                  encoding="utf-8") as handle:
+            listed = handle.read().split()
+        self.assertIn("/usr/local/libexec/fast-share-mount-helper", listed)
+        self.assertFalse(any(path.startswith(self.dest) for path in listed))
+
+    def test_reinstall_prunes_old_system_files(self):
+        self.script(INSTALLER, "--system-only")
+        old = os.path.join(self.dest, "usr/local/libexec/fast-share-mount-old-helper")
+        with open(old, "w", encoding="utf-8") as handle:
+            handle.write("old")
+        manifest = os.path.join(self.dest, f"usr/local/share/{APP_ID}/installed-files.txt")
+        with open(manifest, "a", encoding="utf-8") as handle:
+            handle.write("/usr/local/libexec/fast-share-mount-old-helper\n")
+        result = self.script(INSTALLER, "--system-only")
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertFalse(os.path.exists(old))
+
+    def test_uninstall_finds_a_usr_install_without_prefix(self):
+        result = self.script(INSTALLER, "--system-only", "--prefix", "/usr")
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        result = self.script(UNINSTALLER, "--system-only")
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertEqual(all_files(self.dest), [])
+
+    def test_destdir_never_touches_the_home_folder(self):
+        home = os.path.join(self.dest, "realhome")
+        os.makedirs(os.path.join(home, ".local/bin"))
+        marker = os.path.join(home, ".local/bin/fast-share-mount")
+        with open(marker, "w", encoding="utf-8") as handle:
+            handle.write("the user's installed command")
+        self.env["HOME"] = home
+        for script in (INSTALLER, UNINSTALLER):
+            result = self.script(script)
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+            with open(marker, encoding="utf-8") as handle:
+                self.assertEqual(handle.read(), "the user's installed command")
 
     def test_prefix_usr(self):
         result = self.script(INSTALLER, "--system-only", "--prefix", "/usr")

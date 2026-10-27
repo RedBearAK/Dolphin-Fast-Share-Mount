@@ -16,8 +16,8 @@
 #   sudo ./install.sh --system-only
 #   ./install.sh --prefix /usr    system part under /usr instead of /usr/local
 #
-# DESTDIR=/some/dir stages the system part below that folder (for packaging
-# and tests): no sudo, no ownership changes, no polkit check.
+# DESTDIR=/some/dir stages only the system part below that folder (for
+# packaging and tests): no sudo, no ownership changes, no polkit check.
 #
 # SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -90,14 +90,17 @@ install_file() {
     INSTALLED+=("$target")
 }
 
+# prune_old_files MANIFEST STAGING FOLDER...
 # Remove files listed in an older manifest that this version did not install.
-# Only plain files below the given folders are touched.
+# Manifest entries are the installed paths without the staging folder
+# (DESTDIR). Only plain files below the given folders are touched.
 prune_old_files() {
-    local manifest=$1 path keep kept root allowed
-    shift
+    local manifest=$1 staging=$2 path keep kept root allowed
+    shift 2
     [[ -f $manifest && ! -L $manifest ]] || return 0
     while IFS= read -r path; do
         [[ -n $path ]] || continue
+        path=$staging$path
         keep=""
         for kept in "${INSTALLED[@]}"; do
             [[ $kept == "$path" ]] && keep=1 && break
@@ -113,11 +116,12 @@ prune_old_files() {
     done < "$manifest"
 }
 
+# write_manifest MANIFEST STAGING: the installed paths, without STAGING.
 write_manifest() {
-    local manifest=$1 tmp
+    local manifest=$1 staging=$2 tmp
     ensure_dir "${manifest%/*}"
     tmp=$(mktemp -- "${manifest%/*}/.manifest.XXXXXX")
-    printf '%s\n' "${INSTALLED[@]}" > "$tmp"
+    printf '%s\n' "${INSTALLED[@]#"$staging"}" > "$tmp"
     chmod 0644 -- "$tmp"
     mv -fT -- "$tmp" "$manifest"
 }
@@ -141,8 +145,8 @@ install_system() {
     install_file "$SOURCE_DIR/polkit/$POLICY_NAME.in" "$root$policy" 0644 @HELPER@ "$helper"
     install_file "$SOURCE_DIR/uninstall.sh" "$root$share_dir/uninstall.sh" 0755
     INSTALLED+=("$root$manifest")
-    prune_old_files "$root$manifest" "$root$PREFIX/libexec" "$root/usr/share/polkit-1/actions" "$root$share_dir"
-    write_manifest "$root$manifest"
+    prune_old_files "$root$manifest" "$root" "$root$PREFIX/libexec" "$root/usr/share/polkit-1/actions" "$root$share_dir"
+    write_manifest "$root$manifest" "$root"
 
     if [[ -z $root ]]; then
         local path dir
@@ -206,8 +210,8 @@ install_user() {
     done
     install_file "$SOURCE_DIR/uninstall.sh" "$own_dir/uninstall.sh" 0755
     INSTALLED+=("$manifest")
-    prune_old_files "$manifest" "$bin_dir" "$data/kio/servicemenus" "$own_dir"
-    write_manifest "$manifest"
+    prune_old_files "$manifest" "" "$bin_dir" "$data/kio/servicemenus" "$own_dir"
+    write_manifest "$manifest" ""
 
     local settings="$config/$APP_ID.conf"
     if [[ -L $settings || -e $settings ]]; then
@@ -259,7 +263,9 @@ main() {
         both)
             (( EUID != 0 )) || die "Run the installer as your desktop user, not with sudo (it asks for root itself)"
             if [[ -n $DESTDIR ]]; then
+                say "DESTDIR is set: staging the system part only."
                 install_system
+                return
             elif command -v sudo >/dev/null; then
                 say "Root rights are needed for the system part (helper and polkit action)."
                 sudo -- /bin/bash "$SOURCE_DIR/install.sh" --system-only --prefix "$PREFIX" \

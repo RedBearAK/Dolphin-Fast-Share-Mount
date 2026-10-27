@@ -15,7 +15,10 @@
 #   ./uninstall.sh --force           detach mounts that are in use (lazy unmount)
 #   ./uninstall.sh --user-only       only your part (unmounts through the helper)
 #   sudo ./uninstall.sh --system-only
-#   ./uninstall.sh --prefix /usr     system part installed under /usr
+#   ./uninstall.sh --prefix /usr     only the system part under /usr (without
+#                                    --prefix both /usr/local and, when this
+#                                    tool installed there, /usr are covered)
+#   DESTDIR=/some/dir ./uninstall.sh removes only a staged system part
 #
 # Running it twice is harmless. Mount folders under /run are only ever
 # removed when empty, so a share that is still mounted is never deleted
@@ -37,6 +40,7 @@ POLICY_NAME=io.github.redbearak.dolphin-fast-share-mount.policy
 KEEP_CONFIG=""
 KEEP_PASSWORDS=""
 FORCE=""
+PREFIX_GIVEN=""
 FAILED=0
 
 say() { printf '%s\n' "$*"; }
@@ -44,7 +48,7 @@ warn() { printf 'Warning: %s\n' "$*" >&2; FAILED=1; }
 die() { printf 'Error: %s\n' "$*" >&2; exit 1; }
 
 usage() {
-    sed -n '3,22p' "$SCRIPT" | sed 's/^# \{0,1\}//'
+    sed -n '3,25p' "$SCRIPT" | sed 's/^# \{0,1\}//'
 }
 
 remove_file() {
@@ -66,12 +70,15 @@ remove_tree() {
     fi
 }
 
+# remove_listed MANIFEST STAGING FOLDER...: remove the files a manifest lists
+# (paths without the staging folder), but only below the given folders.
 remove_listed() {
-    local manifest=$1 path
-    shift
+    local manifest=$1 staging=$2 path
+    shift 2
     [[ -f $manifest && ! -L $manifest ]] || return 0
     while IFS= read -r path; do
         [[ -n $path ]] || continue
+        path=$staging$path
         local root allowed=""
         for root in "$@"; do
             [[ $path == "$root"/* && $path != *"/../"* ]] && allowed=1 && break
@@ -136,23 +143,39 @@ unmount_everything() {
 }
 
 uninstall_system() {
-    local root=$DESTDIR
+    local root=$DESTDIR prefix helper share_dir
+    local -a prefixes=()
     if [[ -z $root ]]; then
         (( EUID == 0 )) || die "The system part needs root: sudo $0 --system-only"
     fi
-    local helper="$PREFIX/libexec/fast-share-mount-helper"
-    local policy="/usr/share/polkit-1/actions/$POLICY_NAME"
-    local share_dir="$PREFIX/share/$APP_ID"
+    # Without --prefix, cover both places the installer can use: /usr/local
+    # always, /usr when this tool's file list is there (a helper in /usr
+    # without it may belong to a distribution package and is left alone).
+    if [[ -n $PREFIX_GIVEN ]]; then
+        prefixes=("$PREFIX")
+    else
+        prefixes=(/usr/local)
+        [[ ! -f $root/usr/share/$APP_ID/installed-files.txt ]] || prefixes+=(/usr)
+    fi
 
-    say "Removing the system part under ${root:-}$PREFIX"
     if [[ -z $root ]]; then
+        helper=""
+        for prefix in "${prefixes[@]}"; do
+            [[ -x $prefix/libexec/fast-share-mount-helper ]] && helper=$prefix/libexec/fast-share-mount-helper && break
+        done
         unmount_everything "$helper"
     fi
-    remove_listed "$root$share_dir/installed-files.txt" \
-        "$root$PREFIX/libexec" "$root/usr/share/polkit-1/actions" "$root$share_dir"
-    remove_file "$root$helper"
-    remove_file "$root$policy"
-    remove_tree "$root$share_dir"
+    for prefix in "${prefixes[@]}"; do
+        say "Removing the system part under ${root:-}$prefix"
+        share_dir="$prefix/share/$APP_ID"
+        remove_listed "$root$share_dir/installed-files.txt" "$root" \
+            "$root$prefix/libexec" "$root/usr/share/polkit-1/actions" "$root$share_dir"
+        if [[ $prefix == /usr/local || -n $PREFIX_GIVEN ]]; then
+            remove_file "$root$prefix/libexec/fast-share-mount-helper"
+        fi
+        remove_tree "$root$share_dir"
+    done
+    remove_file "$root/usr/share/polkit-1/actions/$POLICY_NAME"
     say "System part removed."
 }
 
@@ -198,7 +221,8 @@ uninstall_user() {
     if [[ -n $unmount_first && -x $command ]]; then
         local -a force=()
         [[ -z $FORCE ]] || force=(--force)
-        "$command" unmount --all "${force[@]}" || warn "some of your shares could not be unmounted"
+        "$command" unmount --all "${force[@]}" \
+            || die "Some of your shares could not be unmounted; nothing was removed. Close the programs using them and run again, or add --force"
     fi
     if [[ -z $KEEP_PASSWORDS ]]; then
         if [[ -x $command ]]; then
@@ -214,7 +238,7 @@ uninstall_user() {
         fi
     fi
 
-    remove_listed "$own_dir/installed-files.txt" "$bin_dir" "$data/kio/servicemenus" "$own_dir"
+    remove_listed "$own_dir/installed-files.txt" "" "$bin_dir" "$data/kio/servicemenus" "$own_dir"
     remove_file "$command"
     remove_file "$data/kio/servicemenus/dolphin-fast-share-mount.desktop"
     remove_file "$data/kio/servicemenus/dolphin-fast-share-mount-unmount.desktop"
@@ -245,6 +269,7 @@ main() {
             --prefix)
                 (( $# >= 2 )) || die "--prefix needs a folder"
                 PREFIX=${2%/}
+                PREFIX_GIVEN=1
                 shift 2
                 ;;
             --version) say "$VERSION"; exit 0 ;;
@@ -266,10 +291,13 @@ main() {
             ;;
         both)
             (( EUID != 0 )) || die "Run the uninstaller as your desktop user, not with sudo (it asks for root itself)"
-            local -a pass=(--system-only --prefix "$PREFIX")
+            local -a pass=(--system-only)
+            [[ -z $PREFIX_GIVEN ]] || pass+=(--prefix "$PREFIX")
             [[ -z $FORCE ]] || pass+=(--force)
             if [[ -n $DESTDIR ]]; then
+                say "DESTDIR is set: removing the staged system part only."
                 uninstall_system
+                exit "$FAILED"
             elif command -v sudo >/dev/null; then
                 say "Root rights are needed to unmount and remove the system part."
                 sudo -- /bin/bash "$SCRIPT" "${pass[@]}" || die "The system part was not removed and your files were left in place (idle shares may already be unmounted)"

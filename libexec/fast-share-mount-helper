@@ -46,6 +46,7 @@ PASSWORD_MAX=512
 MOUNT_TIMEOUT=60
 UMOUNT_TIMEOUT=30
 PROBE_TIMEOUT=10
+LOCK_WAIT=120
 
 declare -A EXIT_CODES=(
     [EUSAGE]=2 [EINVALID]=3
@@ -306,7 +307,9 @@ ensure_root_dir() {
         fail EINTERNAL "Unexpected symbolic link in the mount tree" "$path"
     fi
     if [[ ! -e $path ]]; then
-        mkdir -m "$mode" -- "$path" || fail EINTERNAL "Could not create a folder" "$path"
+        # Another helper run may create it at the same moment.
+        mkdir -m "$mode" -- "$path" 2>/dev/null || [[ -d $path && ! -L $path ]] \
+            || fail EINTERNAL "Could not create a folder" "$path"
     fi
     [[ -d $path ]] || fail EINTERNAL "Not a folder" "$path"
     owner=$(stat -c %u -- "$path")
@@ -359,11 +362,27 @@ kernel_cifs_lines() {
         fi
     } | while IFS= read -r line; do
         [[ ${line,,} == *cifs* ]] || continue
-        if [[ $line == *"\\\\"* && ${line,,} != *"\\\\${host,,}"* ]]; then
-            continue
-        fi
-        printf '%s\n' "$line"
+        line_names_only_host "$line" "$host" && printf '%s\n' "$line"
     done | tail -n 4
+}
+
+# True when every server named in LINE (as \\server or //server) is HOST.
+line_names_only_host() {
+    local rest=$1 host=${2,,}
+    local pattern='(\\\\|//)([A-Za-z0-9._-]+)(.*)'
+    while [[ $rest =~ $pattern ]]; do
+        [[ ${BASH_REMATCH[2],,} == "$host" ]] || return 1
+        rest=${BASH_REMATCH[3]}
+    done
+    return 0
+}
+
+# Serialise this user's mounts and unmounts (two at once could pick the same
+# mount point). The lock is held on the user's folder until the helper exits.
+lock_user_root() {
+    local uid=$1
+    exec 8<"$MOUNT_BASE/$uid" || fail EINTERNAL "Could not open the user's mount folder" "$MOUNT_BASE/$uid"
+    flock -w "$LOCK_WAIT" 8 || fail EBUSY "Another mount or unmount of this user is still running"
 }
 
 # The mount answers a stat within PROBE_TIMEOUT seconds.
@@ -413,6 +432,7 @@ cmd_mount() {
     fi
 
     ensure_user_root "$uid"
+    lock_user_root "$uid"
     local host_dir
     host_dir="$MOUNT_BASE/$uid/$(safe_name "$host")"
     ensure_root_dir "$host_dir" 0755
@@ -556,8 +576,13 @@ cmd_unmount() {
     require_root
     check_target_uid "$uid"
     is_tool_mountpoint_path "$path" "$uid" || fail EINVALID "Not a mount point of this tool" "$path"
-    if [[ -L ${path%/*} || -L $path ]]; then
+    # Only the parent is checked for a link: looking at the mount point itself
+    # would ask the server, which may be gone (the reason for --lazy).
+    if [[ -L ${path%/*} ]]; then
         fail EINTERNAL "Unexpected symbolic link in the mount tree" "$path"
+    fi
+    if [[ -d $MOUNT_BASE/$uid && ! -L $MOUNT_BASE/$uid ]]; then
+        lock_user_root "$uid"
     fi
     if ! mount_entry_at "$MOUNTINFO" "$path" || [[ $ENTRY_FSTYPE != cifs && $ENTRY_FSTYPE != smb3 ]]; then
         remove_if_empty "$path" "${path%/*}"
@@ -588,6 +613,9 @@ cmd_unmount_all() {
     else
         check_target_uid "$uid"
         root=$MOUNT_BASE/$uid
+        if [[ -d $root && ! -L $root ]]; then
+            lock_user_root "$uid"
+        fi
     fi
     [[ ! -L $root ]] || fail EINTERNAL "Unexpected symbolic link in the mount tree" "$root"
 

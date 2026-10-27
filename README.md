@@ -30,7 +30,7 @@ The mount appears at:
 /run/dolphin-fast-share-mount/<your uid>/<server>/<share>
 ```
 
-One folder per server keeps shares with generic names (`Shared`, `Media`, `Backups`) on different servers apart. In the folder name, every byte other than an ASCII letter, a digit, `.`, `_` or `-` becomes `_` (so `My Share` becomes `My_Share`, and `Ö`, two bytes in UTF-8, becomes `__`), a leading `.` becomes `_`, and names are cut at 100 bytes. If two shares end up with the same folder name, the second gets `~2`, the next `~3`, and so on.
+One folder per server keeps shares with generic names (`Shared`, `Media`, `Backups`) on different servers apart. In the folder name, every byte other than an ASCII letter, a digit, `.`, `_` or `-` becomes `_` (so `My Share` becomes `My_Share`, and `Ö`, two bytes in UTF-8, becomes `__`), a leading `.` becomes `_`, and names are cut at 100 bytes. If two shares end up with the same folder name, the second gets `~2`, the next `~3`, up to `~9`.
 
 ## Requirements
 
@@ -40,12 +40,12 @@ One folder per server keeps shares with generic names (`Shared`, `Media`, `Backu
 - `/usr/bin/python3` 3.10 or later (standard library only)
 - `pkexec` (polkit), or `sudo` with `ksshaskpass`
 - `kdialog` (or `zenity`) for the password prompt and dialogs
-- Optional: `notify-send` for notifications, KWallet (`kwallet-query`) or libsecret (`secret-tool`) to remember passwords
+- Optional: `notify-send` for notifications; KWallet (`kwallet-query` and `gdbus`) or libsecret (`secret-tool`) to remember passwords
 
 On openSUSE:
 
 ```
-sudo zypper install cifs-utils acl kdialog libnotify-tools kwallet-tools
+sudo zypper install cifs-utils acl kdialog libnotify-tools kwallet-tools glib2-tools
 ```
 
 ## Install
@@ -92,7 +92,8 @@ fast-share-mount unmount [--force] PATH|URL|SERVER/SHARE...
 fast-share-mount unmount --all
 fast-share-mount list
 fast-share-mount check
-fast-share-mount forget [DOMAIN;]USER@SERVER
+fast-share-mount forget 'USER@SERVER'
+fast-share-mount forget 'DOMAIN;USER@SERVER'
 fast-share-mount forget --all
 fast-share-mount --version
 ```
@@ -101,12 +102,12 @@ Examples:
 
 ```
 fast-share-mount mount smb://nas.local/Media/Films
-fast-share-mount mount smb://CORP;jordan@fileserver/Projects
+fast-share-mount mount 'smb://CORP;jordan@fileserver/Projects'
 fast-share-mount mount smb://guest@printer-box/Scans
 fast-share-mount unmount nas.local/Media
 ```
 
-The user name comes from the address (`smb://user@server/share`), else from the settings file, else your login name. `smb://guest@...` or `--guest` connects without a password. In a terminal, the command prints its messages and prompts there; from the Dolphin menu it uses notifications and dialogs.
+The user name comes from `--user`, else from the address (`smb://user@server/share`), else from the settings file, else your login name. Quote addresses that contain `;` in a shell. `smb://guest@...` or `--guest` connects without a password. In a terminal, the command prints its messages and prompts there; from the Dolphin menu it uses notifications and dialogs.
 
 ## Settings
 
@@ -120,7 +121,7 @@ The user name comes from the address (`smb://user@server/share`), else from the 
 | `open_mode` | `tab`, `window`, `none` | `tab` |
 | `remember_password` | `ask`, `always`, `never` | `ask` |
 
-SMB1 (`1.0`) is never used unless you set it here, because it is insecure. A server that only speaks SMB1 produces an error that says so.
+SMB1 (`1.0`) is never used unless you set it here or pass `--vers 1.0`, because it is insecure. A server that only speaks SMB1 produces an error that says so.
 
 ## How it works, and why it is safe
 
@@ -128,13 +129,13 @@ Mounting needs root, so the tool has two halves.
 
 `fast-share-mount` runs as you. It reads the address Dolphin passes, checks whether the share is already mounted (by this tool, or by anything else such as fstab or Smb4K, in which case it opens that mount instead of stacking a second one), checks that the server answers on its SMB port, gets the password from KWallet or asks for it, and starts the helper through pkexec.
 
-`fast-share-mount-helper` is a short bash script, the only code that runs as root. It:
+`fast-share-mount-helper` is a bash script, the only code that runs as root. It:
 
 - validates every argument (server name, share name, user name, domain, port, SMB version), refusing anything that could add a mount option, such as a comma in a share name;
 - computes every mount point itself; for unmounting it accepts only a path of exactly the shape `/run/dolphin-fast-share-mount/<uid>/<server>/<share>` that holds a CIFS mount;
 - under pkexec, only mounts for the user who asked;
 - receives the password on stdin and hands it to `mount.cifs` through a pipe, so it never appears in a process list, an environment or a file;
-- keeps the whole tree under `/run/dolphin-fast-share-mount` owned by root, so no user can swap a folder for a symbolic link and redirect a mount; your own folder in it carries an access list that lets only you in (it shows as `drwxr-x---`, root's group and everyone else having no access), so other users on the computer cannot see which servers and shares you have mounted, let alone the files;
+- keeps the whole tree under `/run/dolphin-fast-share-mount` owned by root, so no user can swap a folder for a symbolic link and redirect a mount; your own folder in it carries an access list that lets only you in (it shows as `drwxr-x---`, root's group and everyone else having no access), so other users on the computer cannot open your mounted files or list your folder. They can still see which servers and shares are mounted, and for which user name, because the system's mount table (`/proc/self/mountinfo`) is readable by everyone; `fast-share-mount list` does not show other users' mounts;
 - mounts with `uid`/`gid` set to you, `noperm` (the server enforces permissions), `nosuid` and `nodev`;
 - checks the mount is really there and readable before reporting success.
 
