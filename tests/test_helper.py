@@ -269,6 +269,25 @@ class ErrorTests(unittest.TestCase):
                 "CIFS: VFS: cifs_mount", f"CIFS: Status code returned {status}\nCIFS: VFS: cifs_mount")
             self.assertEqual(self.sort_access(stray), ("EAUTH", self.OPEN), status)
 
+    def test_only_the_status_just_before_our_session_line_counts(self):
+        # another mount's status (it started before ours) falls inside our attempt
+        stray = self.WRONG_PASSWORD.replace(
+            "CIFS: Status code returned", "CIFS: Status code returned 0xc0000072 "
+            "STATUS_ACCOUNT_DISABLED\nCIFS: Status code returned")
+        self.assertEqual(self.sort_access(self.OTHER + "\n" + stray),
+                         ("EAUTH", "Login failed: wrong user name or password"))
+        # a host-less line between the status and the session line breaks the link
+        cut = self.with_status("0xc0000234 STATUS_ACCOUNT_LOCKED_OUT").replace(
+            "CIFS: VFS: \\\\127.0.0.1 failed", "CIFS: unrelated line\nCIFS: VFS: \\\\127.0.0.1 failed")
+        self.assertEqual(self.sort_access(cut),
+                         ("EAUTH", "Login failed: wrong user name or password"))
+        # older kernels log a line naming our server in between; the status still counts
+        older = self.with_status("0xc0000234 STATUS_ACCOUNT_LOCKED_OUT").replace(
+            "CIFS: VFS: \\\\127.0.0.1 failed",
+            "CIFS: VFS: \\\\127.0.0.1 Send error in SessSetup = -13\nCIFS: VFS: \\\\127.0.0.1 failed")
+        self.assertEqual(self.sort_access(older),
+                         ("EDENIED", "The server refused this account (STATUS_ACCOUNT_LOCKED_OUT)"))
+
     def test_refused_account_names_its_status(self):
         for status in ("STATUS_ACCOUNT_LOCKED_OUT", "STATUS_ACCOUNT_RESTRICTION",
                        "STATUS_INVALID_LOGON_HOURS", "STATUS_INVALID_WORKSTATION"):
@@ -292,6 +311,10 @@ class ErrorTests(unittest.TestCase):
         kernel = self.with_status("0xc0000064 STATUS_NO_SUCH_USER").replace("-13", "-5")
         self.assertEqual(self.sort_access(kernel, 5),
                          ("EAUTH", "Login failed: wrong user name or password"))
+        stray = self.SHARE_REFUSED.replace("-13", "-5").replace(
+            "CIFS: VFS: cifs_mount", "CIFS: Status code returned 0xc0000064 STATUS_NO_SUCH_USER\n"
+                                     "CIFS: VFS: cifs_mount")
+        self.assertEqual(self.sort_access(stray, 5), ("EINTERNAL", "mount.cifs failed"))
         session_only = self.WRONG_PASSWORD.replace(
             "CIFS: Status code returned 0xc000006d STATUS_LOGON_FAILURE\n", "").replace("-13", "-5")
         self.assertEqual(self.sort_access(session_only, 5), ("EINTERNAL", "mount.cifs failed"))

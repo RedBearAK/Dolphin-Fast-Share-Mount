@@ -482,6 +482,7 @@ class FakeKWallet:
 
     def __init__(self, entries=None):
         self.entries = dict(entries or {})
+        self.folder = bool(self.entries)
         self.argv_seen = []
 
     def __call__(self, argv, input_text=None, timeout=30, env=None):
@@ -492,8 +493,9 @@ class FakeKWallet:
             if "-r" in argv:
                 if key in self.entries:
                     return done(self.entries[key] + "\n")
-                return done("The folder dolphin-fast-share-mount does not exist!\n"
-                            f"Failed to read entry {key} value from the kdewallet wallet.\n")
+                missing = "" if self.folder else \
+                    "The folder dolphin-fast-share-mount does not exist!\n"
+                return done(missing + f"Failed to read entry {key} value from the kdewallet wallet.\n")
             if key in self.entries:
                 text = input_text or ""
                 self.entries[key] = text[:-1] if text.endswith("\n") else text
@@ -504,6 +506,7 @@ class FakeKWallet:
             if method == "open":
                 return done("(1234,)")
             if method == "createFolder":
+                self.folder = True
                 return done("(true,)")
             if method == "hasEntry":
                 return done("(true,)" if args[2] in self.entries else "(false,)")

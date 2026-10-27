@@ -314,10 +314,12 @@ attempt_lines() {
 }
 
 # A failed login and a refused share both end in mount error 13 (EACCES).
-# Only the kernel's lines tell them apart. A failed login always logs
-# "\\host failed to create a new SMB session", which names our server (other
-# servers' lines are filtered out); its "Status code returned STATUS_..."
-# line names no server, so a status counts only next to that session line.
+# Only the kernel's lines tell them apart. A failed login logs "\\host failed
+# to create a new SMB session", which names our server (other servers' lines
+# are filtered out; the line is rate-limited, and without it the message
+# stays open). Its "Status code returned STATUS_..." line comes just before
+# and names no server, so a status counts only when it is the nearest one
+# before the session line, with nothing but lines naming our server between.
 # A share refused after a good login logs neither; that is only concluded
 # when this attempt's lines are complete (up to "cifs_mount failed ... -13")
 # and hold no status line at all, since a stray one may be another mount's
@@ -328,14 +330,20 @@ attempt_lines() {
 classify_access_error() {
     local number=$1 kernel=$2 source=$3 text="" status=""
     attempt_lines "$kernel" "$source"
-    local session=""
+    local session="" session_status="" candidate="" line
     if [[ -n $ATTEMPT_FOUND && -z $ATTEMPT_MIXED ]]; then
         text=$ATTEMPT
     fi
-    if [[ $text == *"failed to create a new SMB session"* ]]; then
-        session=1
-    fi
-    if [[ -n $session && $text =~ STATUS_(ACCOUNT_[A-Z_]+|PASSWORD_EXPIRED|PASSWORD_MUST_CHANGE|INVALID_LOGON_HOURS|INVALID_WORKSTATION) ]]; then
+    while IFS= read -r line; do
+        if [[ $line == *"failed to create a new SMB session"* ]]; then
+            session=1 session_status=$candidate
+        elif [[ $line == *"Status code returned"* ]]; then
+            candidate=$line
+        elif [[ $line != *\\\\* && $line != *//* ]]; then
+            candidate=""
+        fi
+    done <<< "$text"
+    if [[ -n $session && $session_status =~ STATUS_(ACCOUNT_[A-Z_]+|PASSWORD_EXPIRED|PASSWORD_MUST_CHANGE|INVALID_LOGON_HOURS|INVALID_WORKSTATION) ]]; then
         status=${BASH_REMATCH[0]}
         CLASS_CODE=EDENIED
         CLASS_MESSAGE="The server refused this account ($status)"
@@ -345,7 +353,7 @@ classify_access_error() {
     elif [[ $number == 128 ]]; then
         CLASS_CODE=EDENIED
         CLASS_MESSAGE="The server refused this account (the account is disabled)"
-    elif [[ -n $session && $text == *STATUS_NO_SUCH_USER* ]]; then
+    elif [[ -n $session && $session_status == *STATUS_NO_SUCH_USER* ]]; then
         CLASS_CODE=EAUTH
         CLASS_MESSAGE="Login failed: wrong user name or password"
     elif [[ $number == 5 ]]; then
