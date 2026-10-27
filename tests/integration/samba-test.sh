@@ -113,11 +113,21 @@ echo "Starting Samba ($IMAGE) on 127.0.0.1:$PORT"
 "$engine" rm -f "$NAME" >/dev/null 2>&1 || true
 "$engine" run -d --rm --name "$NAME" -p "127.0.0.1:$PORT:445" --entrypoint /bin/sh \
     "$IMAGE" -c "$SAMBA_SETUP" sh "$TEST_USER" "$TEST_PASSWORD" >/dev/null
-for _ in $(seq 30); do
-    (exec 3<>"/dev/tcp/127.0.0.1/$PORT") 2>/dev/null && break
+# Rootless podman's port forwarder accepts connections before smbd runs, so
+# an open port proves nothing: wait for smbd to say it is ready.
+ready=""
+for _ in $(seq 60); do
+    if "$engine" logs "$NAME" 2>&1 | grep -q "daemon 'smbd' finished starting up"; then
+        ready=1
+        break
+    fi
     sleep 1
 done
-sleep 2
+if [[ -z $ready ]]; then
+    echo "Samba did not start within 60 seconds. Its log:"
+    "$engine" logs --tail 30 "$NAME" 2>&1 | sed 's/^/      samba: /'
+    exit 2
+fi
 
 sudo -v
 

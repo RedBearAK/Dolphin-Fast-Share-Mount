@@ -178,6 +178,9 @@ class ErrorTests(unittest.TestCase):
         self.assertEqual(self.classify(32, "mount error(2): No such file or directory"), "ENOSHARE")
         self.assertEqual(self.classify(32, "mount error(113): No route to host"), "EHOST")
         self.assertEqual(self.classify(32, "mount error(111): Connection refused"), "EHOST")
+        self.assertEqual(self.classify(32, "mount error(103): Software caused connection abort"),
+                         "EHOST")
+        self.assertEqual(self.classify(32, "mount error(104): Connection reset by peer"), "EHOST")
         self.assertEqual(self.classify(32, "mount error(112): Host is down"), "EHOST")
         self.assertEqual(self.classify(32, "mount error(112): Host is down",
                                        "CIFS: VFS: \\\\old Dialect not supported by server"),

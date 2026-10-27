@@ -253,6 +253,10 @@ classify_mount_error() {
             CLASS_CODE=EHOST
             CLASS_MESSAGE="The server could not be reached"
             ;;
+        103|104)
+            CLASS_CODE=EHOST
+            CLASS_MESSAGE="The server closed the connection (it may be starting or restarting)"
+            ;;
         112)
             CLASS_CODE=EHOST
             CLASS_MESSAGE="The server is down or only speaks SMB1"
