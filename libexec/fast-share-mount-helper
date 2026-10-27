@@ -16,7 +16,7 @@
 # Usage:
 #   fast-share-mount-helper mount --uid UID --host HOST --share SHARE
 #           [--user USER] [--domain DOMAIN] [--port PORT] [--vers VERSION]
-#           [--guest]
+#           [--guest] [--label NAME]
 #   fast-share-mount-helper unmount --uid UID --path MOUNTPOINT [--lazy]
 #   fast-share-mount-helper unmount-all --uid UID [--lazy]
 #   fast-share-mount-helper unmount-all --every-user [--lazy]
@@ -138,6 +138,30 @@ safe_name() {
     fi
     name=${name:0:100}
     printf '%s' "${name:-_}"
+}
+
+# A server's display name (as Dolphin's network view shows it), at most 64
+# bytes of printable text without "/".
+is_valid_label() {
+    local label=$1
+    local LC_ALL=C
+    [[ -n $label && ${#label} -le 64 && $label != */* && $label != *[[:cntrl:]]* ]]
+}
+
+# Percent-encode every byte outside [A-Za-z0-9._~-], for an x-gvfs-name
+# option (Solid decodes it); the result holds no "," or "=".
+percent_encode() {
+    local text=$1 out="" char i
+    local LC_ALL=C
+    for (( i = 0; i < ${#text}; i++ )); do
+        char=${text:i:1}
+        if [[ $char == [A-Za-z0-9._~-] ]]; then
+            out+=$char
+        else
+            out+=$(printf '%%%02X' "'$char")
+        fi
+    done
+    printf '%s' "$out"
 }
 
 # mountinfo escapes space, tab, newline and backslash as octal. Share names
@@ -496,10 +520,10 @@ probe_readable() {
 # ---- commands ------------------------------------------------------------------
 
 cmd_mount() {
-    local uid="" host="" share="" user="" domain="" port="" vers="" guest=""
+    local uid="" host="" share="" user="" domain="" port="" vers="" guest="" label=""
     while (( $# )); do
         case $1 in
-            --uid|--host|--share|--user|--domain|--port|--vers)
+            --uid|--host|--share|--user|--domain|--port|--vers|--label)
                 (( $# >= 2 )) || fail EUSAGE "Missing value for $1"
                 case $1 in
                     --uid) uid=$2 ;;
@@ -509,6 +533,7 @@ cmd_mount() {
                     --domain) domain=$2 ;;
                     --port) port=$2 ;;
                     --vers) vers=$2 ;;
+                    --label) label=$2 ;;
                 esac
                 shift 2
                 ;;
@@ -528,7 +553,9 @@ cmd_mount() {
     [[ -z $domain ]] || is_valid_domain "$domain" || fail EINVALID "Invalid domain" "$domain"
     [[ -z $port ]] || is_valid_port "$port" || fail EINVALID "Invalid port" "$port"
     [[ -z $vers ]] || is_valid_vers "$vers" || fail EINVALID "Invalid SMB version" "$vers"
+    [[ -z $label ]] || is_valid_label "$label" || fail EINVALID "Invalid server display name" "$label"
     command -v mount.cifs >/dev/null || fail EMISSING "mount.cifs is missing (package cifs-utils)"
+    command -v mount >/dev/null || fail EMISSING "mount is missing (package util-linux)"
 
     if [[ -z $guest ]]; then
         read_password
@@ -552,8 +579,12 @@ cmd_mount() {
             return 0
         fi
     done < <(cifs_mounts_under "$MOUNTINFO" "$host_dir")
+    # The folder (and the name in Dolphin's sidebar) is "Server-Share" when
+    # the caller gives the server's display name, else the share name.
+    local name=$share
+    [[ -z $label ]] || name="$label-$share"
     for suffix in "" "~2" "~3" "~4" "~5" "~6" "~7" "~8" "~9"; do
-        candidate="$host_dir/$(safe_name "$share")$suffix"
+        candidate="$host_dir/$(safe_name "$name")$suffix"
         if mount_entry_at "$MOUNTINFO" "$candidate"; then
             continue
         fi
@@ -582,15 +613,19 @@ cmd_mount() {
     [[ -z $domain ]] || options+=",domain=$domain"
     [[ -z $port ]] || options+=",port=$port"
     [[ -z $vers ]] || options+=",vers=$vers"
+    # Solid shows these in Dolphin's sidebar; mount(8) keeps them in
+    # /run/mount/utab (the kernel never sees x- options).
+    options+=",x-gvfs-name=$(percent_encode "$name"),x-gvfs-icon=folder-remote"
 
     log info "mounting $source at $mountpoint (options: $options)"
     local started err="" status=0 kernel
     started=$(date +%s.%N)
+    # Through mount(8), which runs mount.cifs and records the x- options.
     if [[ -n $guest ]]; then
-        err=$(timeout "$MOUNT_TIMEOUT" mount.cifs "$source" "$mountpoint" -o "$options" 2>&1 >/dev/null) \
+        err=$(timeout "$MOUNT_TIMEOUT" mount -t cifs "$source" "$mountpoint" -o "$options" 2>&1 >/dev/null) \
             || status=$?
     else
-        err=$(PASSWD_FD=3 timeout "$MOUNT_TIMEOUT" mount.cifs "$source" "$mountpoint" -o "$options" \
+        err=$(PASSWD_FD=3 timeout "$MOUNT_TIMEOUT" mount -t cifs "$source" "$mountpoint" -o "$options" \
                 3< <(printf '%s' "$PASSWORD") 2>&1 >/dev/null) \
             || status=$?
     fi

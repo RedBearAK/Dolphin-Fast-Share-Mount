@@ -473,6 +473,106 @@ class KioFuseTests(unittest.TestCase):
         self.assertEqual(app.ui.errors, [])
 
 
+def dns_labels(*labels):
+    return b"".join(bytes([len(x.encode())]) + x.encode() for x in labels) + b"\0"
+
+
+def mdns_packet(records):
+    """An mDNS response with RECORDS as (owner bytes, type, rdata bytes)."""
+    import struct
+    body = b"".join(owner + struct.pack(">HHIH", rtype, 1, 120, len(rdata)) + rdata
+                    for owner, rtype, rdata in records)
+    return struct.pack(">HHHHHH", 0, 0x8400, 0, len(records), 0, 0) + body
+
+
+def smb_records(instance, target, address=None):
+    import struct
+    owner = dns_labels(instance, "_smb", "_tcp", "local")
+    records = [(dns_labels("_smb", "_tcp", "local"), 12, owner),
+               (owner, 33, struct.pack(">HHH", 0, 0, 445) + dns_labels(*target.split(".")))]
+    if address:
+        records.append((dns_labels(*target.split(".")), 1, bytes(map(int, address.split(".")))))
+    return records
+
+
+class DisplayNameTests(unittest.TestCase):
+    def test_reply_gives_instance_and_target(self):
+        services, addresses = fsm.parse_mdns_reply(mdns_packet(
+            smb_records("Jordan's NAS", "nas.local", "192.0.2.7")))
+        self.assertEqual(services, {"Jordan's NAS": "nas.local"})
+        self.assertEqual(addresses, {"nas.local": {"192.0.2.7"}})
+
+    def test_compressed_names_are_followed(self):
+        import struct
+        header = struct.pack(">HHHHHH", 0, 0x8400, 0, 1, 0, 0)
+        owner = dns_labels("Media Box", "_smb", "_tcp", "local")
+        # the target "mediabox" + pointer to "local" inside the owner name
+        local_at = 12 + len(owner) - len(dns_labels("local"))
+        target = bytes([8]) + b"mediabox" + struct.pack(">H", 0xC000 | local_at)
+        rdata = struct.pack(">HHH", 0, 0, 445) + target
+        packet = header + owner + struct.pack(">HHIH", 33, 1, 120, len(rdata)) + rdata
+        self.assertEqual(fsm.parse_mdns_reply(packet)[0], {"Media Box": "mediabox.local"})
+
+    def test_malformed_packets_raise_instead_of_hanging(self):
+        import struct
+        loop = struct.pack(">HHHHHH", 0, 0x8400, 0, 1, 0, 0) + struct.pack(">H", 0xC00C)
+        good = mdns_packet(smb_records("NAS", "nas.local"))
+        for packet in (loop, good[:-5], good[:7], b""):
+            with self.assertRaises((ValueError, IndexError, struct.error)):
+                fsm.parse_mdns_reply(packet)
+
+    def test_record_longer_than_the_packet_is_refused(self):
+        import struct
+        owner = dns_labels("NAS", "_smb", "_tcp", "local")
+        rdata = struct.pack(">HHH", 0, 0, 445) + dns_labels("nas", "local")
+        packet = struct.pack(">HHHHHH", 0, 0x8400, 0, 1, 0, 0) + owner + \
+            struct.pack(">HHIH", 33, 1, 120, len(rdata) + 40) + rdata
+        with self.assertRaises(ValueError):
+            fsm.parse_mdns_reply(packet)
+
+    def test_other_services_do_not_count(self):
+        import struct
+        owner = dns_labels("Printer", "_ipp", "_tcp", "local")
+        packet = mdns_packet([(owner, 33, struct.pack(">HHH", 0, 0, 631) + dns_labels("printer", "local"))])
+        self.assertEqual(fsm.parse_mdns_reply(packet)[0], {})
+
+    def lookup(self, host, packets, addresses=()):
+        sock = mock.MagicMock()
+        sock.__enter__.return_value = sock
+        sock.recvfrom.side_effect = [(p, ("192.0.2.1", 5353)) for p in packets] + [fsm.socket.timeout()]
+        with mock.patch.object(fsm.socket, "socket", return_value=sock), \
+                mock.patch.object(fsm.socket, "getaddrinfo",
+                                  return_value=[(2, 2, 17, "", (a, 0)) for a in addresses]):
+            return fsm.server_display_name(host, timeout=1.0), sock
+
+    def test_server_is_found_by_host_name_in_any_case(self):
+        name, sock = self.lookup("NAS.local", [mdns_packet(smb_records("Other", "other.local")),
+                                               mdns_packet(smb_records("Jordan's NAS", "nas.local"))])
+        self.assertEqual(name, "Jordan's NAS")
+        self.assertEqual(sock.sendto.call_args.args[1], ("224.0.0.251", 5353))
+
+    def test_server_reached_by_another_name_is_found_by_address(self):
+        name, _ = self.lookup("nas.example.net",
+                              [mdns_packet(smb_records("Jordan's NAS", "nas.local", "192.0.2.7"))],
+                              addresses=["192.0.2.7"])
+        self.assertEqual(name, "Jordan's NAS")
+
+    def test_no_match_and_broken_packets_give_none(self):
+        name, _ = self.lookup("nas.example.net",
+                              [b"\x00garbage", mdns_packet(smb_records("Other", "other.local", "192.0.2.9"))],
+                              addresses=["192.0.2.7"])
+        self.assertIsNone(name)
+
+    def test_folder_label(self):
+        self.assertEqual(fsm.folder_label("photos.example.net", "Photos"), "Photos")
+        self.assertEqual(fsm.folder_label("photos.example.net", None), "photos")
+        self.assertEqual(fsm.folder_label("192.0.2.7", None), "192.0.2.7")
+        self.assertEqual(fsm.folder_label("nas", "Bad/Name\x07 "), "BadName")
+        long = fsm.folder_label("nas", "é" * 40)
+        self.assertEqual(long, "é" * 32)
+        self.assertEqual(len(long.encode()), 64)
+
+
 class FakeKWallet:
     """kwallet-query and the KWallet D-Bus calls as they behave in KDE
     Frameworks 6 (checked against kwalletd6 on openSUSE, 2026-10-26):
@@ -621,6 +721,8 @@ class MountFlowTests(unittest.TestCase):
         app.opened = []
         app.open_folder = app.opened.append
         mock.patch.object(fsm, "read_mounts", return_value=list(mounts)).start()
+        # no network in tests: the DNS-SD lookup finds nothing
+        mock.patch.object(fsm, "server_display_name", return_value=None).start()
         self.addCleanup(mock.patch.stopall)
         app.elevator = mock.Mock()
         app.elevator.run_helper.side_effect = list(helper_results)
@@ -737,6 +839,23 @@ class MountFlowTests(unittest.TestCase):
         fsm.PasswordStore.return_value.get.return_value = None
         self.assertEqual(app.mount_one(fsm.parse_smb_url("smb://nas/Media")), 0)
         fsm.PasswordStore.return_value.put.assert_not_called()
+
+    def test_folder_label_goes_to_the_helper_unless_turned_off(self):
+        app = self.app(FakeUI(passwords=["pw"]), helper_results=[self.ok()])
+        fsm.server_display_name.return_value = "Jordan's NAS"
+        self.assertEqual(app.mount_one(fsm.parse_smb_url("smb://nas/Media")), 0)
+        args = app.elevator.run_helper.call_args.args[1]
+        self.assertEqual(args[args.index("--label") + 1], "Jordan's NAS")
+        app = self.app(FakeUI(passwords=["pw"]), helper_results=[self.ok()])
+        fsm.server_display_name.return_value = None
+        args = (app.mount_one(fsm.parse_smb_url("smb://nas.example.net/Media")),
+                app.elevator.run_helper.call_args.args[1])
+        self.assertEqual(args[1][args[1].index("--label") + 1], "nas")
+        app = self.app(FakeUI(passwords=["pw"]), helper_results=[self.ok()])
+        app.config["folder_name"] = "share"
+        self.assertEqual(app.mount_one(fsm.parse_smb_url("smb://nas/Media")), 0)
+        self.assertNotIn("--label", app.elevator.run_helper.call_args.args[1])
+        fsm.server_display_name.assert_not_called()
 
     def test_port_139_is_tried_when_445_is_closed(self):
         app = self.app(FakeUI(passwords=["pw"]), helper_results=[self.ok()])

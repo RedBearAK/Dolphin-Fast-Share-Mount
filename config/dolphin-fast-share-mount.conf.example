@@ -22,4 +22,9 @@
 # Save a password you typed: ask, always, or never.
 #remember_password=ask
 
+# Name of the mount folder (and of the entry in Dolphin's sidebar):
+# server-share ("Photos-Backups", with the name the server announces in
+# Dolphin's network view, else the first part of its host name) or share.
+#folder_name=server-share
+
 # End of File #

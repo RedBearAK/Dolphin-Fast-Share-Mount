@@ -56,11 +56,13 @@ DEFAULT_CONFIG = {
     "smb_version": "",
     "open_mode": "tab",
     "remember_password": "ask",
+    "folder_name": "server-share",
 }
 CONFIG_CHOICES = {
     "smb_version": ("",) + SMB_VERSIONS,
     "open_mode": ("tab", "window", "none"),
     "remember_password": ("ask", "always", "never"),
+    "folder_name": ("server-share", "share"),
 }
 
 
@@ -416,6 +418,120 @@ def resolve(host: str) -> set:
 
 
 # ---- probes ------------------------------------------------------------------------------
+
+
+# ---- the server's display name ---------------------------------------------------------------
+
+MDNS_ADDRESS = ("224.0.0.251", 5353)
+
+
+def dns_name(data: bytes, pos: int) -> tuple:
+    """(labels, position after the name) of a DNS name, following compression."""
+    labels, end = [], None
+    for _ in range(128):
+        length = data[pos]
+        if length == 0:
+            return labels, (end if end is not None else pos + 1)
+        if length & 0xC0 == 0xC0:
+            if end is None:
+                end = pos + 2
+            pos = ((length & 0x3F) << 8) | data[pos + 1]
+        elif length & 0xC0:
+            raise ValueError("bad label")
+        else:
+            labels.append(data[pos + 1:pos + 1 + length].decode("utf-8", "replace"))
+            pos += 1 + length
+    raise ValueError("name too long")
+
+
+def parse_mdns_reply(data: bytes) -> tuple:
+    """(SRV {instance: target host}, A {host: {addresses}}) from one mDNS packet.
+
+    Only records for SMB services (_smb._tcp) count. Raises ValueError (or
+    IndexError/struct.error) on a malformed packet."""
+    import struct
+    _, _, questions, answers, authority, extra = struct.unpack(">HHHHHH", data[:12])
+    pos = 12
+    for _ in range(questions):
+        _, pos = dns_name(data, pos)
+        pos += 4
+    services, addresses = {}, {}
+    for _ in range(answers + authority + extra):
+        owner, pos = dns_name(data, pos)
+        rtype, _, _, length = struct.unpack(">HHIH", data[pos:pos + 10])
+        pos += 10
+        if pos + length > len(data):
+            raise ValueError("record past the end")
+        if rtype == 33 and len(owner) >= 3 and [x.lower() for x in owner[1:3]] == ["_smb", "_tcp"]:
+            target, _ = dns_name(data, pos + 6)
+            services[owner[0]] = ".".join(target).lower()
+        elif rtype == 1 and length == 4:
+            addresses.setdefault(".".join(owner).lower(), set()).add(socket.inet_ntoa(data[pos:pos + 4]))
+        pos += length
+    return services, addresses
+
+
+def mdns_query() -> bytes:
+    import struct
+    query = struct.pack(">HHHHHH", 0, 0, 1, 0, 0, 0)
+    for label in ("_smb", "_tcp", "local"):
+        query += bytes([len(label)]) + label.encode()
+    return query + b"\0" + struct.pack(">HH", 12, 1)
+
+
+def server_display_name(host: str, timeout: float = 1.0) -> str | None:
+    """The name the server announces for SMB over DNS-SD (what Dolphin's
+    network view shows, such as "Photos" for photos.local), or None.
+
+    Matched by host name, or by address when the server was reached under
+    another name. One multicast query; stops at the first match."""
+    host = host.lower().rstrip(".")
+    try:
+        wanted = {info[4][0] for info in socket.getaddrinfo(host, None, socket.AF_INET)}
+    except OSError:
+        wanted = set()
+    services, addresses = {}, {}
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.sendto(mdns_query(), MDNS_ADDRESS)
+            deadline = time.monotonic() + timeout
+            while (left := deadline - time.monotonic()) > 0:
+                sock.settimeout(left)
+                try:
+                    data, _ = sock.recvfrom(9000)
+                except socket.timeout:
+                    break
+                try:
+                    found, seen = parse_mdns_reply(data)
+                except Exception:  # noqa: BLE001 - any malformed packet is skipped
+                    continue
+                services.update(found)
+                for name, ips in seen.items():
+                    addresses.setdefault(name, set()).update(ips)
+                for instance, target in services.items():
+                    if target == host or (wanted and wanted & addresses.get(target, set())):
+                        return instance
+    except OSError:
+        return None
+    return None
+
+
+def folder_label(host: str, announced: str | None) -> str:
+    """The server part of a "Server-Share" folder name: the announced name,
+    else the host's first label (an address stays whole). Control characters
+    and "/" are dropped, and it is cut to 64 bytes."""
+    if announced:
+        name = announced
+    else:
+        try:
+            socket.inet_aton(host)
+            name = host
+        except OSError:
+            name = host.split(".")[0]
+    name = "".join(ch for ch in name if ch.isprintable() and ch != "/").strip()
+    while len(name.encode("utf-8")) > 64:
+        name = name[:-1]
+    return name
 
 
 def tcp_probe(host: str, port: int, timeout: float = PROBE_TIMEOUT) -> str | None:
@@ -1049,6 +1165,10 @@ class App:
         vers = self.args.vers or self.config["smb_version"]
         if vers:
             args += ["--vers", vers]
+        if self.config["folder_name"] == "server-share":
+            label = folder_label(ref.host, server_display_name(ref.host))
+            if label:
+                args += ["--label", label]
 
         store = PasswordStore(self.log)
         key = wallet_key(user, ref.host, domain)

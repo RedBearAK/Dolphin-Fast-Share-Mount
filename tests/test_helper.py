@@ -414,6 +414,14 @@ class MountFlowTests(unittest.TestCase):
         with open(stub, "w", encoding="utf-8") as handle:
             handle.write(STUB_MOUNT_CIFS)
         os.chmod(stub, 0o755)
+        # mount(8) as util-linux runs it: "-t cifs" picks the helper, which
+        # gets the rest of the command line and the environment unchanged.
+        stub = os.path.join(self.stub_dir, "mount")
+        with open(stub, "w", encoding="utf-8") as handle:
+            handle.write('#!/bin/bash\n[[ $1 == -t && $2 == cifs ]] || exit 99\n'
+                         'shift 2\nprintf "%s\\n" "$@" > "$STUB_DIR/mount-argv"\n'
+                         'exec "$STUB_DIR/mount.cifs" "$@"\n')
+        os.chmod(stub, 0o755)
         self.mountinfo = os.path.join(self.dir, "mountinfo")
         with open(self.mountinfo, "w", encoding="utf-8") as handle:
             handle.write("22 1 0:21 / / rw - btrfs /dev/sda2 rw\n")
@@ -451,6 +459,45 @@ class MountFlowTests(unittest.TestCase):
         since = self.read("since")
         self.assertRegex(since, r"^[0-9]+\.[0-9]{9}$")
         self.assertLessEqual(abs(float(since) - before), 5)
+
+    def test_display_name_makes_the_folder_and_sidebar_name(self):
+        result = self.mount("--uid", "1000", "--host", "photos.example.net", "--share", "Backups",
+                            "--user", "jordan", "--label", "Jordan's NAS")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        mountpoint = os.path.join(self.base, "1000", "photos.example.net", "Jordan_s_NAS-Backups")
+        self.assertEqual(result.stdout, f"OK\t{mountpoint}\t3.1.1\n")
+        self.assertEqual(self.read("mount-argv").splitlines()[:2],
+                         ["//photos.example.net/Backups", mountpoint])
+        options = self.read("argv").splitlines()[3].split(",")
+        self.assertIn("x-gvfs-name=Jordan%27s%20NAS-Backups", options)
+        self.assertIn("x-gvfs-icon=folder-remote", options)
+
+    def test_without_a_display_name_the_folder_is_the_share(self):
+        result = self.mount("--uid", "1000", "--host", "nas", "--share", "Media", "--user", "kris")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(result.stdout.startswith(f"OK\t{self.base}/1000/nas/Media\t"))
+        self.assertIn("x-gvfs-name=Media", self.read("argv").splitlines()[3].split(","))
+
+    def test_share_mounted_under_its_old_folder_name_is_already_mounted(self):
+        first = self.mount("--uid", "1000", "--host", "nas", "--share", "Media", "--user", "kris")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        again = self.mount("--uid", "1000", "--host", "nas", "--share", "Media", "--user", "kris",
+                           "--label", "Nas")
+        self.assertEqual(again.stdout, f"ALREADY\t{self.base}/1000/nas/Media\t3.1.1\n")
+
+    def test_invalid_display_names_are_refused(self):
+        for label in ("x" * 65, "a/b", "tab\there", "nl\nhere"):
+            result = self.mount("--uid", "1000", "--host", "nas", "--share", "Media",
+                                "--user", "kris", "--label", label)
+            self.assertEqual(result.returncode, 3, repr(label))
+            self.assertTrue(result.stderr.startswith("EINVALID\t"), repr(label))
+        ok = self.mount("--uid", "1000", "--host", "nas", "--share", "Media", "--user", "kris",
+                        "--label", "x" * 64)
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        self.assertTrue(ok.stdout.startswith(f"OK\t{self.base}/1000/nas/{'x' * 64}-Media\t"))
+        empty = self.mount("--uid", "1000", "--host", "other", "--share", "Media", "--user", "kris",
+                           "--label", "")
+        self.assertTrue(empty.stdout.startswith(f"OK\t{self.base}/1000/other/Media\t"), empty.stderr)
 
     def test_success_passes_password_only_through_the_pipe(self):
         secret = " p@ss, word=1 %x\\y "
@@ -679,6 +726,14 @@ class KernelLineTests(unittest.TestCase):
             "CIFS: VFS: \\\\NAS Dialect not supported",
             "CIFS: VFS: cifs_mount failed w/return code = -112",
         ])
+
+
+class PercentEncodeTests(unittest.TestCase):
+    def test_only_safe_bytes_stay(self):
+        for text, expected in (("Photos-Backups", "Photos-Backups"),
+                               ("Jordan's NAS, home=1", "Jordan%27s%20NAS%2C%20home%3D1"),
+                               ("Öl~a_b.c", "%C3%96l~a_b.c"), ("100%", "100%25")):
+            self.assertEqual(bash('percent_encode "$1"', text).stdout, expected)
 
 
 class KernelLineAttemptTests(unittest.TestCase):

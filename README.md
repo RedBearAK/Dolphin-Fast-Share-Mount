@@ -29,8 +29,10 @@ Every outcome is a desktop notification, and every failure is also a dialog that
 The mount appears at:
 
 ```
-/run/dolphin-fast-share-mount/<your uid>/<server>/<share>
+/run/dolphin-fast-share-mount/<your uid>/<server>/<Server>-<share>
 ```
+
+for example `/run/dolphin-fast-share-mount/1000/photos.local/Photos-Backups`. `<server>` is the host name as in the address. `<Server>` is the name the server announces on the network, the one Dolphin's network view shows (with its own capitals), or the first part of the host name when it announces none; an address such as `192.168.1.20` stays whole. Dolphin's sidebar lists the mount under the same name, with a network-folder icon. Set `folder_name=share` to name the folder after the share alone.
 
 One folder per server keeps shares with generic names (`Shared`, `Media`, `Backups`) on different servers apart. In the folder name, every byte other than an ASCII letter, a digit, `.`, `_` or `-` becomes `_` (so `My Share` becomes `My_Share`, and `Ö`, two bytes in UTF-8, becomes `__`), a leading `.` becomes `_`, and names are cut at 100 bytes. If two shares end up with the same folder name, the second gets `~2`, the next `~3`, up to `~9`.
 
@@ -123,6 +125,7 @@ The user name comes from `--user`, else from the address (`smb://user@server/sha
 | `smb_version` | `3.1.1`, `3.0.2`, `3.0`, `3`, `2.1`, `2.0`, `default`, `1.0` | empty: the kernel picks the newest version both sides speak (2.1 or later) |
 | `open_mode` | `tab`, `window`, `none` | `tab` |
 | `remember_password` | `ask`, `always`, `never` | `ask` |
+| `folder_name` | `server-share`, `share` | `server-share` |
 
 SMB1 (`1.0`) is never used unless you set it here or pass `--vers 1.0`, because it is insecure. A server that only speaks SMB1 produces an error that says so.
 
