@@ -830,6 +830,9 @@ def explain(result: HelperResult, ref: ShareRef, user: str) -> tuple:
     if code == "EAUTH":
         return ("Login failed", f"Login failed for {who}: wrong user name or password, "
                 f"or no access to the share '{ref.share}' (mount error 13).")
+    if code == "EDENIED":
+        return ("Access denied", f"{who}, share '{ref.share}': {result.message} "
+                f"(mount error 13).")
     if code == "ENOSHARE":
         return ("Share not found", f"Share '{ref.share}' not found on {ref.host} (mount error 2).")
     if code == "EHOST":

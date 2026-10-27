@@ -184,6 +184,12 @@ class HelperOutputTests(unittest.TestCase):
         title, body = fsm.explain(fsm.HelperResult(False, [], "EAUTH", "x"), ref, "jordan")
         self.assertIn("jordan@photos.example.net", body)
         title, body = fsm.explain(fsm.HelperResult(
+            False, [], "EDENIED", "The login worked, but the server refused access to the share"),
+            ref, "jordan")
+        self.assertEqual((title, body), ("Access denied",
+                         "jordan@photos.example.net, share 'Media2': The login worked, but the "
+                         "server refused access to the share (mount error 13)."))
+        title, body = fsm.explain(fsm.HelperResult(
             False, [], "EMISSING", "mount.cifs is missing (package cifs-utils)"), ref, "jordan")
         self.assertEqual(title, "Required component missing")
         self.assertIn("cifs-utils", body)
@@ -490,6 +496,16 @@ class MountFlowTests(unittest.TestCase):
         self.assertEqual(app.mount_one(fsm.parse_smb_url("smb://nas/Media")), 1)
         self.assertEqual(app.elevator.run_helper.call_count, 3)
         self.assertEqual(app.ui.errors[0][0], "Login failed")
+
+    def test_refused_share_does_not_ask_for_the_password_again(self):
+        refused = fsm.HelperResult(False, [], "EDENIED",
+                                   "The login worked, but the server refused access to the share")
+        ui = FakeUI(passwords=["one", "two"])
+        app = self.app(ui, helper_results=[refused])
+        self.assertEqual(app.mount_one(fsm.parse_smb_url("smb://nas/Media")), 1)
+        self.assertEqual(app.elevator.run_helper.call_count, 1)
+        self.assertEqual(len(ui.prompts), 1)
+        self.assertEqual(ui.errors[0][0], "Access denied")
 
     def test_cancelled_prompt_mounts_nothing(self):
         app = self.app(FakeUI(passwords=[]))

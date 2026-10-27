@@ -22,7 +22,7 @@ Right-click a folder on the mount (any local folder shows the entry; it explains
 
 - **Fast share mount → Unmount fast share mount**
 
-Every outcome is a desktop notification, and every failure is also a dialog that names the cause: wrong password, share not found, server not reachable, a missing component with the command that installs it, or a dismissed authorisation request.
+Every outcome is a desktop notification, and every failure is also a dialog that names the cause: wrong password, an account or share the server refuses, share not found, server not reachable, a missing component with the command that installs it, or a dismissed authorisation request.
 
 The mount appears at:
 

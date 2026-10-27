@@ -187,6 +187,65 @@ class ErrorTests(unittest.TestCase):
                                           "Unknown error"), "EHOST")
         self.assertEqual(self.classify(32, "mount error(22): Invalid argument"), "EINTERNAL")
 
+    # Kernel lines as journalctl printed them on openSUSE (kernel 7.2) for a
+    # wrong password and for a share refused after a good login.
+    WRONG_PASSWORD = ("CIFS: Attempting to mount //127.0.0.1/Shared\n"
+                      "CIFS: Status code returned 0xc000006d STATUS_LOGON_FAILURE\n"
+                      "CIFS: VFS: \\\\127.0.0.1 failed to create a new SMB session with Unknown: -13\n"
+                      "CIFS: VFS: cifs_mount failed w/return code = -13")
+    SHARE_REFUSED = ("CIFS: Attempting to mount //127.0.0.1/Shared\n"
+                     "CIFS: VFS: cifs_mount failed w/return code = -13")
+    EACCES = "mount error(13): Permission denied"
+
+    def sort_access(self, kernel):
+        result = bash('classify_mount_error 32 "$1" "$2"; printf "%s|%s" "$CLASS_CODE" "$CLASS_MESSAGE"',
+                      self.EACCES, kernel)
+        return tuple(result.stdout.split("|", 1))
+
+    def test_wrong_password_is_a_failed_login(self):
+        self.assertEqual(self.sort_access(self.WRONG_PASSWORD),
+                         ("EAUTH", "Login failed: wrong user name or password"))
+
+    def test_failed_session_without_a_status_line_is_a_failed_login(self):
+        kernel = self.WRONG_PASSWORD.replace(
+            "CIFS: Status code returned 0xc000006d STATUS_LOGON_FAILURE\n", "")
+        self.assertEqual(self.sort_access(kernel)[0], "EAUTH")
+
+    def test_refused_share_after_a_good_login(self):
+        self.assertEqual(self.sort_access(self.SHARE_REFUSED),
+                         ("EDENIED", "The login worked, but the server refused access to the share"))
+
+    def test_earlier_attempt_in_the_same_second_does_not_count(self):
+        self.assertEqual(self.sort_access(self.WRONG_PASSWORD + "\n" + self.SHARE_REFUSED)[0],
+                         "EDENIED")
+        self.assertEqual(self.sort_access(self.SHARE_REFUSED + "\n" + self.WRONG_PASSWORD)[0],
+                         "EAUTH")
+
+    def test_refused_account_names_its_status(self):
+        kernel = self.WRONG_PASSWORD.replace("0xc000006d STATUS_LOGON_FAILURE",
+                                             "0xc0000234 STATUS_ACCOUNT_LOCKED_OUT")
+        self.assertEqual(self.sort_access(kernel),
+                         ("EDENIED", "The server refused this account (STATUS_ACCOUNT_LOCKED_OUT)"))
+        kernel = self.WRONG_PASSWORD.replace("0xc000006d STATUS_LOGON_FAILURE",
+                                             "0xc0000071 STATUS_PASSWORD_EXPIRED")
+        self.assertEqual(self.sort_access(kernel)[1],
+                         "The server refused this account (STATUS_PASSWORD_EXPIRED)")
+
+    def test_incomplete_or_missing_kernel_lines_stay_open_to_both_causes(self):
+        open_message = "Login failed: wrong user name or password, or no access to this share"
+        # the attempt's last line has not reached the journal yet
+        self.assertEqual(self.sort_access("CIFS: Attempting to mount //127.0.0.1/Shared"),
+                         ("EAUTH", open_message))
+        # no kernel lines at all (journal unreadable)
+        self.assertEqual(self.sort_access(""), ("EAUTH", open_message))
+        # lines without the attempt's start (cut off) do not prove a refused share
+        self.assertEqual(self.sort_access("CIFS: VFS: cifs_mount failed w/return code = -13"),
+                         ("EAUTH", open_message))
+
+    def test_refused_share_exit_status(self):
+        result = bash('fail EDENIED "x"')
+        self.assertEqual(result.returncode, 19)
+
     def test_fail_line_and_status(self):
         result = bash('fail EAUTH "Login failed" "$1"', "detail with\ttab\nand newline")
         self.assertEqual(result.returncode, 10)

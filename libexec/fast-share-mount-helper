@@ -52,7 +52,7 @@ declare -A EXIT_CODES=(
     [EUSAGE]=2 [EINVALID]=3
     [EAUTH]=10 [ENOSHARE]=11 [EHOST]=12 [EDIALECT]=13 [EBUSY]=14
     [ENOTMOUNTED]=15 [EMISSING]=16 [EPERMS]=17 [ETIMEOUT]=18
-    [EINTERNAL]=20
+    [EDENIED]=19 [EINTERNAL]=20
 )
 
 PASSWORD=""
@@ -240,8 +240,7 @@ classify_mount_error() {
     fi
     case $number in
         13)
-            CLASS_CODE=EAUTH
-            CLASS_MESSAGE="Login failed: wrong user name or password, or no access to this share"
+            classify_access_error "$kernel"
             ;;
         2)
             CLASS_CODE=ENOSHARE
@@ -277,6 +276,37 @@ classify_mount_error() {
             fi
             ;;
     esac
+}
+
+# mount error 13 (EACCES) covers both a failed login and a share the server
+# refuses after a good login. Only the kernel's lines tell them apart, and
+# only the lines of this attempt count: they start at its "Attempting to
+# mount" line (earlier attempts can fall in the same second). A failed login
+# names its status or reports that the SMB session failed. A refused share
+# shows neither, so it is only concluded when the attempt's last line
+# ("cifs_mount failed ... -13") has reached the journal; otherwise the
+# message stays open to both causes.
+classify_access_error() {
+    local kernel=$1 attempt="" status=""
+    if [[ $kernel == *"Attempting to mount"* ]]; then
+        attempt=${kernel##*Attempting to mount}
+    fi
+    local text=${attempt:-$kernel}
+    if [[ $text =~ STATUS_(ACCOUNT_[A-Z_]+|PASSWORD_EXPIRED|PASSWORD_MUST_CHANGE|INVALID_LOGON_HOURS|INVALID_WORKSTATION) ]]; then
+        status=${BASH_REMATCH[0]}
+        CLASS_CODE=EDENIED
+        CLASS_MESSAGE="The server refused this account ($status)"
+    elif [[ $text == *STATUS_LOGON_FAILURE* || $text == *STATUS_WRONG_PASSWORD* \
+            || $text == *STATUS_NO_SUCH_USER* || $text == *"failed to create a new SMB session"* ]]; then
+        CLASS_CODE=EAUTH
+        CLASS_MESSAGE="Login failed: wrong user name or password"
+    elif [[ -n $attempt && $attempt == *"cifs_mount failed w/return code = -13"* ]]; then
+        CLASS_CODE=EDENIED
+        CLASS_MESSAGE="The login worked, but the server refused access to the share"
+    else
+        CLASS_CODE=EAUTH
+        CLASS_MESSAGE="Login failed: wrong user name or password, or no access to this share"
+    fi
 }
 
 # ---- caller and directories ------------------------------------------------------
@@ -365,7 +395,7 @@ kernel_cifs_lines() {
         if line_names_only_host "$line" "$host"; then
             printf '%s\n' "$line"
         fi
-    done | tail -n 4
+    done | tail -n 8
 }
 
 # True when every server named in LINE (as \\server or //server) is HOST.

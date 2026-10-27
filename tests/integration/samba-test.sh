@@ -80,7 +80,7 @@ trap 'cleanup; rm -rf -- "$TMP"' EXIT
 # runs inside the container as sh -c SCRIPT sh USER PASSWORD
 # shellcheck disable=SC2016
 SAMBA_SETUP='set -eu
-mkdir -p /srv/shared /srv/public
+mkdir -p /srv/shared /srv/public /srv/locked
 cat > /etc/samba/smb.conf <<CONF
 [global]
    server role = standalone server
@@ -98,6 +98,9 @@ cat > /etc/samba/smb.conf <<CONF
    path = /srv/public
    read only = no
    guest ok = yes
+[Locked]
+   path = /srv/locked
+   valid users = root
 CONF
 adduser -D -H "$1"
 chown "$1" /srv/shared
@@ -123,6 +126,7 @@ common=(--uid "$UID_SELF" --host 127.0.0.1 --port "$PORT")
 check "wrong password" "10||EAUTH" "$(helper wrong mount "${common[@]}" --share Shared --user "$TEST_USER")"
 check "no mount point left after failure" "absent" "$([[ -e $BASE/127.0.0.1/Shared ]] && echo present || echo absent)"
 check "missing share" "11||ENOSHARE" "$(helper "$TEST_PASSWORD" mount "${common[@]}" --share Nope --user "$TEST_USER")"
+check "share refused after a good login" "19||EDENIED" "$(helper "$TEST_PASSWORD" mount "${common[@]}" --share Locked --user "$TEST_USER")"
 check "mount" "0|OK|" "$(helper "$TEST_PASSWORD" mount "${common[@]}" --share Shared --user "$TEST_USER")"
 require_mount "$BASE/127.0.0.1/Shared"
 check "mount again is ALREADY" "0|ALREADY|" "$(helper "$TEST_PASSWORD" mount "${common[@]}" --share shared --user "$TEST_USER")"
@@ -136,7 +140,9 @@ check "write and read back" "written by the test" "$(cat "$mountpoint/test-file.
 check "user folder owned by root, group bits show the ACL mask" "750 0" "$(sudo stat -c '%a %u' "$BASE")"
 check "user ACL" "user::rwx user:$UID_SELF:r-x group::--- mask::r-x other::---" \
     "$(sudo getfacl -pn "$BASE" 2>/dev/null | grep -v '^#' | grep . | tr '\n' ' ' | sed 's/ $//')"
-check "other users cannot list" "denied" "$(sudo -u nobody ls "$BASE" >/dev/null 2>&1 && echo allowed || echo denied)"
+listing() { sudo runuser -u nobody -- ls -- "$1" >/dev/null 2>&1 && echo allowed || echo denied; }
+check "other users can list the tree, not the user's folder" "allowed denied" \
+    "$(listing "${BASE%/*}") $(listing "$BASE")"
 vers=$(sed -n "s|.* $mountpoint .* - cifs .*vers=\([0-9.]*\).*|\1|p" /proc/self/mountinfo)
 check "SMB 2.1 or later negotiated" "yes" "$([[ $vers =~ ^(2\.1|3) ]] && echo yes || echo "no ($vers)")"
 
