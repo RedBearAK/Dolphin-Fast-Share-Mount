@@ -469,6 +469,95 @@ class KioFuseTests(unittest.TestCase):
         self.assertEqual(app.ui.errors, [])
 
 
+class FakeKWallet:
+    """kwallet-query and the KWallet D-Bus calls as they behave in KDE
+    Frameworks 6 (checked against kwalletd6 on openSUSE, 2026-10-26):
+    kwallet-query -r on a missing entry exits 0 and prints an error message
+    on stdout, and kwallet-query -w exits 0 but only overwrites an entry
+    that already exists."""
+
+    def __init__(self, entries=None):
+        self.entries = dict(entries or {})
+        self.argv_seen = []
+
+    def __call__(self, argv, input_text=None, timeout=30, env=None):
+        self.argv_seen.append(list(argv))
+        done = lambda out="", code=0: subprocess.CompletedProcess(argv, code, out, "")
+        if argv[0] == "kwallet-query":
+            key = argv[argv.index("-r") + 1] if "-r" in argv else argv[argv.index("-w") + 1]
+            if "-r" in argv:
+                if key in self.entries:
+                    return done(self.entries[key] + "\n")
+                return done("The folder dolphin-fast-share-mount does not exist!\n"
+                            f"Failed to read entry {key} value from the kdewallet wallet.\n")
+            if key in self.entries:
+                text = input_text or ""
+                self.entries[key] = text[:-1] if text.endswith("\n") else text
+            return done()
+        if argv[0] == "gdbus":
+            method = argv[argv.index("--method") + 1].rsplit(".", 1)[1]
+            args = argv[argv.index("--method") + 2:]
+            if method == "open":
+                return done("(1234,)")
+            if method == "createFolder":
+                return done("(true,)")
+            if method == "hasEntry":
+                return done("(true,)" if args[2] in self.entries else "(false,)")
+            if method == "readPassword":
+                return done(repr((self.entries.get(args[2], ""),)))
+            if method == "writePassword":
+                self.entries[args[2]] = args[3]
+                return done("(0,)")
+            if method == "removeEntry":
+                self.entries.pop(args[2], None)
+                return done("(0,)")
+        raise AssertionError(f"unexpected command {argv}")
+
+
+class PasswordStoreTests(unittest.TestCase):
+    def store(self, wallet):
+        mock.patch.object(fsm, "run", wallet).start()
+        mock.patch.object(fsm, "which", lambda name: f"/usr/bin/{name}").start()
+        mock.patch.object(fsm.PasswordStore, "_kwallet_service",
+                          staticmethod(lambda: ("org.kde.kwalletd6", "/modules/kwalletd6"))).start()
+        mock.patch.object(fsm.PasswordStore, "_wallet_name", staticmethod(lambda: "kdewallet")).start()
+        self.addCleanup(mock.patch.stopall)
+        store = fsm.PasswordStore(mock.Mock())
+        self.assertEqual(store.kind, "kwallet")
+        return store
+
+    def test_missing_entry_is_no_password(self):
+        # kwallet-query's error message must never be taken for a password
+        self.assertIsNone(self.store(FakeKWallet()).get("kkf@photos.example.net"))
+
+    def test_saved_password_is_read(self):
+        store = self.store(FakeKWallet({"jordan@nas": "s3cret, with=comma"}))
+        self.assertEqual(store.get("jordan@nas"), "s3cret, with=comma")
+
+    def test_new_password_is_really_stored_and_never_in_argv(self):
+        wallet = FakeKWallet()
+        store = self.store(wallet)
+        for password in ("first", "it's \"quoted\"", " spaced ", "ünïcødé"):
+            self.assertTrue(store.put("jordan@nas", password))
+            self.assertEqual(wallet.entries["jordan@nas"], password)
+            self.assertEqual(store.get("jordan@nas"), password)
+        self.assertFalse(any(password in " ".join(argv) for argv in wallet.argv_seen
+                             for password in ("first", "spaced", "ünïcødé")))
+
+    def test_write_that_does_not_stick_is_reported_and_cleaned_up(self):
+        wallet = FakeKWallet()
+        store = self.store(wallet)
+        original = wallet.__call__
+
+        def dropping(argv, input_text=None, timeout=30, env=None):
+            if argv[0] == "kwallet-query" and "-w" in argv:
+                return subprocess.CompletedProcess(argv, 0, "", "")
+            return original(argv, input_text, timeout, env)
+        mock.patch.object(fsm, "run", dropping).start()
+        self.assertFalse(store.put("jordan@nas", "lost"))
+        self.assertNotIn("jordan@nas", wallet.entries)
+
+
 class FakeUI:
     def __init__(self, passwords=(), yes=False):
         self.passwords = list(passwords)

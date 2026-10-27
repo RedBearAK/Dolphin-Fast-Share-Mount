@@ -470,6 +470,17 @@ def run(argv: list, input_text: str | None = None, timeout: int = 30,
         return subprocess.CompletedProcess(argv, 124, "", f"{argv[0]}: timed out")
 
 
+def gvariant_string(reply: str | None) -> str | None:
+    """The string in a gdbus reply of the form ('text',), or None."""
+    try:
+        value = ast.literal_eval((reply or "").strip())
+    except (ValueError, SyntaxError):
+        return None
+    if isinstance(value, tuple) and len(value) == 1 and isinstance(value[0], str):
+        return value[0]
+    return None
+
+
 def kio_fuse_folder(text: str) -> str | None:
     """The path, when TEXT (a path or file:// URL) lies inside a kio-fuse mount."""
     if text.startswith("file://"):
@@ -495,14 +506,7 @@ def remote_url(text: str) -> str:
     result = run(["gdbus", "call", "--session", "--dest", "org.kde.KIOFuse",
                   "--object-path", "/org/kde/KIOFuse",
                   "--method", "org.kde.KIOFuse.VFS.remoteUrl", path], timeout=10)
-    reply = None
-    if result.returncode == 0:
-        try:
-            value = ast.literal_eval(result.stdout.strip())
-        except (ValueError, SyntaxError):
-            value = None
-        if isinstance(value, tuple) and len(value) == 1 and isinstance(value[0], str):
-            reply = value[0]
+    reply = gvariant_string(result.stdout) if result.returncode == 0 else None
     if not reply:
         detail = result.stderr.strip() or result.stdout.strip()
         raise UsageError(f"{path} is a kio-fuse folder, and kio-fuse did not say which "
@@ -643,11 +647,15 @@ class PasswordStore:
 
     def get(self, key: str) -> str | None:
         if self.kind == "kwallet":
-            result = run(["kwallet-query", "-f", APP_ID, "-r", key, self._wallet_name()],
-                         timeout=120)
-            if result.returncode == 0 and result.stdout not in ("", "\n"):
-                return result.stdout[:-1] if result.stdout.endswith("\n") else result.stdout
-            return None
+            # Through D-Bus, not kwallet-query: kwallet-query exits 0 and
+            # prints its error message on stdout when the entry is missing.
+            handle = self._kwallet_handle()
+            if handle is None:
+                return None
+            if self._kwallet_dbus("hasEntry", handle, APP_ID, key, COMMAND) != "(true,)":
+                return None
+            return gvariant_string(
+                self._kwallet_dbus("readPassword", handle, APP_ID, key, COMMAND)) or None
         if self.kind == "secret-tool":
             result = run(["secret-tool", "lookup", "application", APP_ID, "account", key],
                          timeout=120)
@@ -660,9 +668,18 @@ class PasswordStore:
             if handle is None:
                 return False
             self._kwallet_dbus("createFolder", handle, APP_ID, COMMAND)
-            result = run(["kwallet-query", "-f", APP_ID, "-w", key, self._wallet_name()],
-                         input_text=password, timeout=120)
-            return result.returncode == 0
+            # kwallet-query takes the password on stdin (never argv), but it
+            # only overwrites an entry that exists, and exits 0 either way.
+            # So create the entry empty over D-Bus, write it, and read it back.
+            if self._kwallet_dbus("hasEntry", handle, APP_ID, key, COMMAND) != "(true,)":
+                self._kwallet_dbus("writePassword", handle, APP_ID, key, "", COMMAND)
+            run(["kwallet-query", "-f", APP_ID, "-w", key, self._wallet_name()],
+                input_text=password, timeout=120)
+            if self.get(key) == password:
+                return True
+            self.log.warning(f"KWallet did not store the password for {key} as given")
+            self._kwallet_dbus("removeEntry", handle, APP_ID, key, COMMAND)
+            return False
         if self.kind == "secret-tool":
             result = run(["secret-tool", "store", f"--label={APP_NAME}: {key}",
                           "application", APP_ID, "account", key],
