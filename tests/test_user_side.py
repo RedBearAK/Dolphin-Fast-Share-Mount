@@ -344,6 +344,11 @@ class CommandLineTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
         self.assertIn("not on a Fast Share Mount mount", result.stderr)
 
+    def test_choose_with_nothing_mounted(self):
+        result = self.run_cli("unmount", "--choose", "/tmp")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Nothing to unmount", result.stderr)
+
     def test_unmount_all_with_nothing_mounted(self):
         result = self.run_cli("unmount", "--all")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -571,6 +576,114 @@ class DisplayNameTests(unittest.TestCase):
         long = fsm.folder_label("nas", "é" * 40)
         self.assertEqual(long, "é" * 32)
         self.assertEqual(len(long.encode()), 64)
+
+
+class ChooseUnmountTests(unittest.TestCase):
+    ROOT = "/run/dolphin-fast-share-mount/1000"
+
+    def entry(self, target, source):
+        return fsm.MountEntry(target, source, "cifs", "rw,vers=3.1.1")
+
+    def app(self, picked, targets=()):
+        args = fsm.build_parser().parse_args(["unmount", "--choose", *targets])
+        app = fsm.App(args)
+        app.uid = 1000
+        app.ui = FakeUI()
+        self.offered = []
+        app.ui.choose_many = lambda text, items: self.offered.append(items) or picked
+        app.unmount_entry = mock.Mock(return_value=0)
+        mock.patch.object(fsm, "read_mounts", return_value=[
+            self.entry(f"{self.ROOT}/photos.example.net/Photos-Backups", "//photos.example.net/Backups"),
+            self.entry(f"{self.ROOT}/nas/Nas-Media", "//nas/Media"),
+            self.entry("/run/dolphin-fast-share-mount/1001/nas/Nas-Media", "//nas/Media"),
+            self.entry("/mnt/fstab-share", "//nas/Other"),
+        ]).start()
+        self.addCleanup(mock.patch.stopall)
+        return app
+
+    def test_only_own_mounts_are_offered_and_the_clicked_one_is_ticked(self):
+        app = self.app([], targets=[f"{self.ROOT}/nas/Nas-Media/Films/2024"])
+        self.assertEqual(app.cmd_unmount(), 0)
+        self.assertEqual(self.offered[0], [
+            ("Nas-Media    //nas/Media", True),
+            ("Photos-Backups    //photos.example.net/Backups", False),
+        ])
+        app.unmount_entry.assert_not_called()
+
+    def test_each_picked_share_is_unmounted(self):
+        app = self.app([1, 0])
+        self.assertEqual(app.cmd_unmount(), 0)
+        unmounted = [c.args[0].target for c in app.unmount_entry.call_args_list]
+        self.assertEqual(unmounted, [f"{self.ROOT}/photos.example.net/Photos-Backups",
+                                     f"{self.ROOT}/nas/Nas-Media"])
+
+    def test_cancel_unmounts_nothing(self):
+        app = self.app(None)
+        self.assertEqual(app.cmd_unmount(), 0)
+        app.unmount_entry.assert_not_called()
+
+    def test_no_way_to_ask_is_an_error(self):
+        app = self.app(None)
+
+        def unable(text, items):
+            raise fsm.UsageError("kdialog or zenity is needed to choose a share")
+        app.ui.choose_many = unable
+        self.assertEqual(app.cmd_unmount(), 1)
+        self.assertEqual(app.ui.errors[0][0], "Cannot ask")
+        app.unmount_entry.assert_not_called()
+
+    def test_choose_and_all_together_are_refused(self):
+        args = fsm.build_parser().parse_args(["unmount", "--choose", "--all"])
+        app = fsm.App(args)
+        app.ui = FakeUI()
+        self.assertEqual(app.cmd_unmount(), 2)
+
+
+class ChooseManyDialogTests(unittest.TestCase):
+    ITEMS = [("Nas-Media    //nas/Media", True), ("Photos-Backups    //photos/Backups", False)]
+
+    def ui(self, tool, stdout, returncode=0):
+        mock.patch.object(fsm, "which", lambda name: f"/usr/bin/{name}" if name == tool else None).start()
+        self.run = mock.patch.object(fsm, "run", return_value=subprocess.CompletedProcess(
+            [], returncode, stdout, "")).start()
+        self.addCleanup(mock.patch.stopall)
+        return fsm.UI(True, mock.Mock())
+
+    def test_kdialog_checklist(self):
+        ui = self.ui("kdialog", "1\n0\n")
+        self.assertEqual(ui.choose_many("Unmount which shares?", self.ITEMS), [1, 0])
+        argv = self.run.call_args.args[0]
+        self.assertEqual(argv[argv.index("--checklist") + 2:],
+                         ["0", self.ITEMS[0][0], "on", "1", self.ITEMS[1][0], "off"])
+
+    def test_zenity_checklist(self):
+        ui = self.ui("zenity", "1\n")
+        self.assertEqual(ui.choose_many("Unmount which shares?", self.ITEMS), [1])
+        argv = self.run.call_args.args[0]
+        self.assertEqual(argv[-6:], ["TRUE", "0", self.ITEMS[0][0], "FALSE", "1", self.ITEMS[1][0]])
+
+    def test_cancel_and_junk_replies(self):
+        self.assertIsNone(self.ui("kdialog", "", returncode=1).choose_many("x", self.ITEMS))
+        self.assertEqual(self.ui("kdialog", "7\nzz\n0\n0\n").choose_many("x", self.ITEMS), [0])
+
+    def test_no_dialog_program_or_terminal_raises(self):
+        mock.patch.object(fsm, "which", return_value=None).start()
+        self.addCleanup(mock.patch.stopall)
+        with self.assertRaises(fsm.UsageError):
+            fsm.UI(True, mock.Mock()).choose_many("x", self.ITEMS)
+        with mock.patch.object(fsm.sys.stdin, "isatty", return_value=False), \
+                self.assertRaises(fsm.UsageError):
+            fsm.UI(False, mock.Mock()).choose_many("x", self.ITEMS)
+
+    def test_terminal_answers(self):
+        ui = fsm.UI(False, mock.Mock())
+        for answer, expected in (("", [0]), ("all", [0, 1]), ("2 1", [1, 0]), ("2,2", [1]),
+                                 ("3", None), ("x", None)):
+            with mock.patch.object(fsm.sys.stdin, "isatty", return_value=True), \
+                    mock.patch("builtins.input", return_value=answer), \
+                    mock.patch("sys.stdout", new_callable=io.StringIO), \
+                    mock.patch("sys.stderr", new_callable=io.StringIO):
+                self.assertEqual(ui.choose_many("x", self.ITEMS), expected, repr(answer))
 
 
 class FakeKWallet:

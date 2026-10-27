@@ -93,6 +93,13 @@ class UserPartTests(unittest.TestCase):
                     self.assertTrue(exec_line.startswith(f'"{self.command}" '), exec_line)
                     self.assertIn("--gui", exec_line)
                     self.assertTrue(exec_line.endswith("%U"))
+            if name.endswith("-unmount.desktop"):
+                # offered everywhere: every file and folder, every protocol, top level
+                entry = parser["Desktop Entry"]
+                self.assertIn("all/all", entry["MimeType"].split(";"))
+                self.assertNotIn("X-KDE-Protocols", entry)
+                self.assertNotIn("X-KDE-Submenu", entry)
+                self.assertIn("--choose", parser["Desktop Action unmount"]["Exec"])
         self.assertTrue(os.path.isfile(self.config))
         with open(os.path.join(self.own_dir, "installed-files.txt"), encoding="utf-8") as handle:
             listed = handle.read().split()

@@ -20,9 +20,11 @@ Right-click a folder, or the empty background of a folder, in an `smb://` locati
 
 When kio-fuse is running, Dolphin may hand the menu a kio-fuse folder (`/run/user/<uid>/kio-fuse-…/smb/…`) instead of the `smb://` address; the tool asks kio-fuse which address the folder stands for and mounts that.
 
-Right-click a folder on the mount (any local folder shows the entry; it explains itself when used elsewhere):
+Right-click anything, anywhere (a file, a folder or the background, local or remote):
 
-- **Fast share mount → Unmount fast share mount**
+- **Unmount fast share mount…** lists the shares the tool has mounted for you, with the one you clicked in already ticked. Tick one or more and press OK. A share that is still in use (an open file, a terminal inside it) is reported, with the offer to detach it anyway. With nothing mounted you get a notification instead of the list.
+
+Dolphin's sidebar lists each mount under Remote. Its eject button does not work (Dolphin then says "must be superuser to unmount"): the mount belongs to root, and the system lets a normal user unmount only what fstab allows, so use the menu entry above.
 
 Every outcome is a desktop notification, and every failure is also a dialog that names the cause: wrong password, an account or share the server refuses, share not found, server not reachable, a missing component with the command that installs it, or a dismissed authorisation request.
 
@@ -95,6 +97,7 @@ fast-share-mount check
 fast-share-mount mount [--tab|--window|--no-open] [--user NAME] [--guest] [--vers VERSION] URL...
 fast-share-mount unmount [--force] PATH|URL|SERVER/SHARE...
 fast-share-mount unmount --all
+fast-share-mount unmount --choose [PATH...]
 fast-share-mount list
 fast-share-mount check
 fast-share-mount forget 'USER@SERVER'
@@ -173,7 +176,7 @@ Set `FAST_SHARE_MOUNT_DEBUG=1` to log the commands run (passwords are never logg
 - Image-based systems such as Fedora Atomic (Kinoite) are not supported yet: `/usr/share` is read-only there and `/usr/local` is a symbolic link into `/var`.
 - Shares stay mounted until you unmount them or reboot; there is no idle timeout.
 - IPv6 address literals in the address (`smb://[fe80::1]/share`) are not supported yet; use the server's name.
-- The unmount entry appears on every local folder, because Dolphin menus cannot check whether a folder is a mount.
+- The eject button in Dolphin's sidebar cannot unmount these shares; use **Unmount fast share mount…** from any context menu.
 - Only SMB/CIFS. NFS may follow with the same helper design.
 
 ## Development
