@@ -8,7 +8,12 @@
 #   tests/integration/samba-test.sh
 #
 # The container listens on 127.0.0.1:4445 (an unprivileged port, which also
-# tests the --port option). Image: docker.io/dperson/samba.
+# tests the --port option). Image: docker.io/dperson/samba, used only for its
+# Samba binaries: the test writes its own smb.conf and accounts. smbd is
+# copied to another path before it starts, because AppArmor attaches profiles
+# by path and a host profile for /usr/sbin/smbd (openSUSE ships one) would
+# confine the container's smbd to the host's shares: logins then succeed but
+# opening the share fails, and the kernel reports mount error 13.
 #
 # SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -44,6 +49,17 @@ check() {
     else
         FAILED=$((FAILED + 1))
         echo "FAIL  $name: expected '$expected', got '$actual'"
+        [[ ! -s $TMP/last ]] || sed 's/^/      helper: /' "$TMP/last"
+    fi
+    : > "$TMP/last"
+}
+
+# stop here when a mount the remaining checks depend on did not happen
+require_mount() {
+    if ! mountpoint -q -- "$1"; then
+        echo "FAIL  $1 is not mounted; stopping. Last Samba log lines:"
+        "$engine" logs --tail 30 "$NAME" 2>&1 | sed 's/^/      samba: /'
+        exit 1
     fi
 }
 
@@ -53,18 +69,47 @@ helper() {
     shift
     out=$(printf '%s\n' "$password" | sudo "$HELPER" "$@" 2>"$TMP/err") || status=$?
     err=$(cut -f1 < "$TMP/err" | tail -n 1)
+    cp -- "$TMP/err" "$TMP/last"
     printf '%s|%s|%s' "$status" "$(cut -f1 <<< "$out" | head -n 1)" "$err"
 }
 
 TMP=$(mktemp -d)
+: > "$TMP/last"
 trap 'cleanup; rm -rf -- "$TMP"' EXIT
+
+# runs inside the container as sh -c SCRIPT sh USER PASSWORD
+# shellcheck disable=SC2016
+SAMBA_SETUP='set -eu
+mkdir -p /srv/shared /srv/public
+cat > /etc/samba/smb.conf <<CONF
+[global]
+   server role = standalone server
+   map to guest = bad user
+   guest account = nobody
+   server min protocol = SMB2_10
+   log level = 2
+   load printers = no
+   disable spoolss = yes
+[Shared]
+   path = /srv/shared
+   read only = no
+   valid users = $1
+[Public]
+   path = /srv/public
+   read only = no
+   guest ok = yes
+CONF
+adduser -D -H "$1"
+chown "$1" /srv/shared
+chmod 0777 /srv/public
+printf "%s\n%s\n" "$2" "$2" | smbpasswd -s -a "$1"
+cp /usr/sbin/smbd /usr/local/bin/test-smbd
+exec /usr/local/bin/test-smbd -FS --no-process-group </dev/null'
 
 echo "Starting Samba ($IMAGE) on 127.0.0.1:$PORT"
 "$engine" rm -f "$NAME" >/dev/null 2>&1 || true
-"$engine" run -d --rm --name "$NAME" -p "127.0.0.1:$PORT:445" "$IMAGE" -p \
-    -u "$TEST_USER;$TEST_PASSWORD" \
-    -s "Shared;/srv/shared;yes;no;no;$TEST_USER" \
-    -s "Public;/srv/public;yes;no;yes" >/dev/null
+"$engine" run -d --rm --name "$NAME" -p "127.0.0.1:$PORT:445" --entrypoint /bin/sh \
+    "$IMAGE" -c "$SAMBA_SETUP" sh "$TEST_USER" "$TEST_PASSWORD" >/dev/null
 for _ in $(seq 30); do
     (exec 3<>"/dev/tcp/127.0.0.1/$PORT") 2>/dev/null && break
     sleep 1
@@ -79,8 +124,10 @@ check "wrong password" "10||EAUTH" "$(helper wrong mount "${common[@]}" --share 
 check "no mount point left after failure" "absent" "$([[ -e $BASE/127.0.0.1/Shared ]] && echo present || echo absent)"
 check "missing share" "11||ENOSHARE" "$(helper "$TEST_PASSWORD" mount "${common[@]}" --share Nope --user "$TEST_USER")"
 check "mount" "0|OK|" "$(helper "$TEST_PASSWORD" mount "${common[@]}" --share Shared --user "$TEST_USER")"
+require_mount "$BASE/127.0.0.1/Shared"
 check "mount again is ALREADY" "0|ALREADY|" "$(helper "$TEST_PASSWORD" mount "${common[@]}" --share shared --user "$TEST_USER")"
 check "guest mount" "0|OK|" "$(helper "" mount "${common[@]}" --share Public --guest)"
+require_mount "$BASE/127.0.0.1/Public"
 
 mountpoint="$BASE/127.0.0.1/Shared"
 check "user owns the files" "$UID_SELF" "$(stat -c %u "$mountpoint")"
