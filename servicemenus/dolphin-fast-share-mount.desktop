@@ -2,16 +2,16 @@
 Type=Service
 MimeType=inode/directory;
 X-KDE-Protocols=smb
-X-KDE-Submenu=Fast share mount
+X-KDE-Submenu=Fast Share Mount
 Actions=mount;mountwindow;
 
 [Desktop Action mount]
-Name=Mount here (fast)
+Name=Mount Here
 Icon=folder-network
 Exec="@BIN@" mount --gui %U
 
 [Desktop Action mountwindow]
-Name=Mount here (fast), new window
+Name=Mount Here in New Window
 Icon=window-new
 Exec="@BIN@" mount --gui --window %U
 

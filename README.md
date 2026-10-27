@@ -15,16 +15,18 @@ If you want the opposite, permanent mounts of network shares that come back afte
 
 Right-click a folder, or the empty background of a folder, in an `smb://` location:
 
-- **Fast share mount → Mount here (fast)** mounts the share and opens the same folder on the mount, in a new tab (or wherever your Dolphin settings open external folders).
-- **Fast share mount → Mount here (fast), new window** does the same in a new window.
+- **Fast Share Mount → Mount Here** mounts the share and opens the same folder on the mount, in a new tab (or wherever your Dolphin settings open external folders).
+- **Fast Share Mount → Mount Here in New Window** does the same in a new window.
 
 When kio-fuse is running, Dolphin may hand the menu a kio-fuse folder (`/run/user/<uid>/kio-fuse-…/smb/…`) instead of the `smb://` address; the tool asks kio-fuse which address the folder stands for and mounts that.
 
 Right-click anything, anywhere (a file, a folder or the background, local or remote):
 
-- **Unmount fast share mount…** lists the shares the tool has mounted for you, with the one you clicked in already ticked. Tick one or more and press OK. A share that is still in use (an open file, a terminal inside it) is reported, with the offer to detach it anyway. With nothing mounted you get a notification instead of the list.
+- **Fast Share Unmount…** lists the shares the tool has mounted for you, with the one you clicked in already ticked. Tick one or more and press OK. A share that is still in use (an open file, a terminal inside it) is reported, with the offer to detach it anyway. With nothing mounted you get a notification instead of the list.
 
-Dolphin's sidebar lists each mount under Remote. Its eject button does not work (Dolphin then says "must be superuser to unmount"): the mount belongs to root, and the system lets a normal user unmount only what fstab allows, so use the menu entry above.
+Dolphin's sidebar lists each mount under Remote. Its own **Unmount** (in the entry's context menu) does not work and says "must be superuser to unmount": the mount belongs to root, and the system lets a normal user unmount only what fstab allows. Use **Fast Share Unmount…** instead.
+
+When more than a few service menu entries apply, Dolphin moves them all into an **Actions** submenu; the two entries are named so that they sort next to each other there.
 
 Every outcome is a desktop notification, and every failure is also a dialog that names the cause: wrong password, an account or share the server refuses, share not found, server not reachable, a missing component with the command that installs it, or a dismissed authorisation request.
 
@@ -176,7 +178,7 @@ Set `FAST_SHARE_MOUNT_DEBUG=1` to log the commands run (passwords are never logg
 - Image-based systems such as Fedora Atomic (Kinoite) are not supported yet: `/usr/share` is read-only there and `/usr/local` is a symbolic link into `/var`.
 - Shares stay mounted until you unmount them or reboot; there is no idle timeout.
 - IPv6 address literals in the address (`smb://[fe80::1]/share`) are not supported yet; use the server's name.
-- The eject button in Dolphin's sidebar cannot unmount these shares; use **Unmount fast share mount…** from any context menu.
+- **Unmount** in the context menu of Dolphin's sidebar entry cannot unmount these shares; use **Fast Share Unmount…** from any context menu.
 - Only SMB/CIFS. NFS may follow with the same helper design.
 
 ## Development

@@ -653,8 +653,18 @@ class ChooseManyDialogTests(unittest.TestCase):
         ui = self.ui("kdialog", "1\n0\n")
         self.assertEqual(ui.choose_many("Unmount which shares?", self.ITEMS), [1, 0])
         argv = self.run.call_args.args[0]
+        self.assertEqual(argv[argv.index("--geometry") + 1], "480x260")
         self.assertEqual(argv[argv.index("--checklist") + 2:],
                          ["0", self.ITEMS[0][0], "on", "1", self.ITEMS[1][0], "off"])
+
+    def test_dialog_grows_with_long_names_and_many_shares_within_limits(self):
+        ui = self.ui("kdialog", "")
+        ui.choose_many("x", [("n" * 60, False)] * 4)
+        argv = self.run.call_args.args[0]
+        self.assertEqual(argv[argv.index("--geometry") + 1], f"{9 * 60 + 140}x{170 + 34 * 4}")
+        ui.choose_many("x", [("n" * 500, False)] * 50)
+        argv = self.run.call_args.args[0]
+        self.assertEqual(argv[argv.index("--geometry") + 1], "1000x640")
 
     def test_zenity_checklist(self):
         ui = self.ui("zenity", "1\n")

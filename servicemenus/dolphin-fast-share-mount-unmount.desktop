@@ -4,7 +4,7 @@ MimeType=all/all;inode/directory;
 Actions=unmount;
 
 [Desktop Action unmount]
-Name=Unmount fast share mount…
+Name=Fast Share Unmount…
 Icon=media-eject
 Exec="@BIN@" unmount --choose --gui %U
 

@@ -706,12 +706,18 @@ class UI:
                 if int(word) - 1 not in picked:
                     picked.append(int(word) - 1)
             return picked
+        # Sized to the longest line and the number of shares (kdialog's
+        # default is narrow), within what fits on a small screen.
+        width = max(480, min(1000, 9 * max(len(label) for label, _ in items) + 140))
+        height = max(260, min(640, 170 + 34 * len(items)))
         if which("kdialog"):
-            argv = ["kdialog", "--title", APP_NAME, "--separate-output", "--checklist", text]
+            argv = ["kdialog", "--title", APP_NAME, "--geometry", f"{width}x{height}",
+                    "--separate-output", "--checklist", text]
             for index, (label, ticked) in enumerate(items):
                 argv += [str(index), label, "on" if ticked else "off"]
         elif which("zenity"):
             argv = ["zenity", "--list", "--checklist", "--title", APP_NAME, "--text", text,
+                    "--width", str(width), "--height", str(height),
                     "--column", "", "--column", "index", "--column", "Share",
                     "--hide-column", "2", "--print-column", "2", "--separator", "\n"]
             for index, (label, ticked) in enumerate(items):
