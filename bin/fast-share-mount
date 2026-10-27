@@ -740,12 +740,12 @@ class UI:
         height = max(260, min(640, 170 + 34 * len(items)))
         if which("kdialog"):
             argv = ["kdialog", "--title", APP_NAME, "--geometry", f"{width}x{height}",
-                    "--separate-output", "--checklist", text]
+                    "--ok-label", verb.capitalize(), "--separate-output", "--checklist", text]
             for index, (label, ticked) in enumerate(items):
                 argv += [str(index), label, "on" if ticked else "off"]
         elif which("zenity"):
             argv = ["zenity", "--list", "--checklist", "--title", APP_NAME, "--text", text,
-                    "--width", str(width), "--height", str(height),
+                    "--width", str(width), "--height", str(height), "--ok-label", verb.capitalize(),
                     "--column", "", "--column", "index", "--column", "Share",
                     "--hide-column", "2", "--print-column", "2", "--separator", "\n"]
             for index, (label, ticked) in enumerate(items):
@@ -762,6 +762,18 @@ class UI:
             if word.isdigit() and int(word) < len(items) and int(word) not in picked:
                 picked.append(int(word))
         return picked
+
+    def choose_with_all(self, text: str, items: list, verb: str, all_label: str) -> list | None:
+        """choose_many with a first item ALL_LABEL that stands for every item
+        (offered from two items on). Indexes refer to ITEMS."""
+        if len(items) < 2:
+            return self.choose_many(text, items, verb)
+        picked = self.choose_many(text, [(all_label, False)] + list(items), verb)
+        if picked is None:
+            return None
+        if 0 in picked:
+            return list(range(len(items)))
+        return [index - 1 for index in picked]
 
     def ask_password(self, prompt: str) -> str | None:
         """None when cancelled or no way to ask."""
@@ -1232,7 +1244,8 @@ class App:
         items = [(f"{share}    (mounted)" if (root.host, share.lower()) in mounted else share, False)
                  for share in shares]
         try:
-            picked = self.ui.choose_many(f"Mount which shares on {root.host}?", items, verb="mount")
+            picked = self.ui.choose_with_all(f"Mount which shares on {root.host}?", items, "mount",
+                                             f"All {len(items)} shares on {root.host}")
         except UsageError as error:
             self.ui.error("Cannot ask", str(error))
             return [], 1
@@ -1431,7 +1444,8 @@ class App:
                 ticked.add(entry.target)
         items = [(f"{os.path.basename(e.target)}    {e.source}", e.target in ticked) for e in own]
         try:
-            picked = self.ui.choose_many("Unmount which shares?", items)
+            picked = self.ui.choose_with_all("Unmount which shares?", items, "unmount",
+                                             f"All {len(items)} mounted shares")
         except UsageError as error:
             self.ui.error("Cannot ask", str(error))
             return 1

@@ -596,7 +596,9 @@ class ChooseUnmountTests(unittest.TestCase):
         app.uid = 1000
         app.ui = FakeUI()
         self.offered = []
-        app.ui.choose_many = lambda text, items: self.offered.append(items) or picked
+        self.labels = []
+        app.ui.choose_with_all = lambda text, items, verb, all_label: \
+            self.labels.append((verb, all_label)) or self.offered.append(items) or picked
         app.unmount_entry = mock.Mock(return_value=0)
         mock.patch.object(fsm, "read_mounts", return_value=[
             self.entry(f"{self.ROOT}/photos.example.net/Photos-Backups", "//photos.example.net/Backups"),
@@ -615,6 +617,7 @@ class ChooseUnmountTests(unittest.TestCase):
             ("Photos-Backups    //photos.example.net/Backups", False),
         ])
         app.unmount_entry.assert_not_called()
+        self.assertEqual(self.labels, [("unmount", "All 2 mounted shares")])
 
     def test_each_picked_share_is_unmounted(self):
         app = self.app([1, 0])
@@ -633,7 +636,7 @@ class ChooseUnmountTests(unittest.TestCase):
 
         def unable(text, items):
             raise fsm.UsageError("kdialog or zenity is needed to choose a share")
-        app.ui.choose_many = unable
+        app.ui.choose_with_all = lambda *a: unable(*a[:2])
         self.assertEqual(app.cmd_unmount(), 1)
         self.assertEqual(app.ui.errors[0][0], "Cannot ask")
         app.unmount_entry.assert_not_called()
@@ -677,6 +680,26 @@ class ChooseManyDialogTests(unittest.TestCase):
         self.assertEqual(ui.choose_many("Unmount which shares?", self.ITEMS), [1])
         argv = self.run.call_args.args[0]
         self.assertEqual(argv[-6:], ["TRUE", "0", self.ITEMS[0][0], "FALSE", "1", self.ITEMS[1][0]])
+
+    def test_ok_button_names_the_action(self):
+        ui = self.ui("kdialog", "")
+        ui.choose_many("x", self.ITEMS, "mount")
+        argv = self.run.call_args.args[0]
+        self.assertEqual(argv[argv.index("--ok-label") + 1], "Mount")
+
+    def test_all_item_stands_for_every_share(self):
+        ui = self.ui("kdialog", "0\n2\n")
+        self.assertEqual(ui.choose_with_all("x", self.ITEMS, "unmount", "All 2 mounted shares"), [0, 1])
+        argv = self.run.call_args.args[0]
+        self.assertEqual(argv[argv.index("--checklist") + 2:argv.index("--checklist") + 5],
+                         ["0", "All 2 mounted shares", "off"])
+        self.assertEqual(self.ui("kdialog", "2\n").choose_with_all("x", self.ITEMS, "unmount", "All"), [1])
+        self.assertIsNone(self.ui("kdialog", "", 1).choose_with_all("x", self.ITEMS, "unmount", "All"))
+
+    def test_no_all_item_for_a_single_share(self):
+        ui = self.ui("kdialog", "0\n")
+        self.assertEqual(ui.choose_with_all("x", self.ITEMS[:1], "mount", "All"), [0])
+        self.assertNotIn("All", self.run.call_args.args[0])
 
     def test_cancel_and_junk_replies(self):
         self.assertIsNone(self.ui("kdialog", "", returncode=1).choose_many("x", self.ITEMS))
@@ -731,8 +754,8 @@ class SharePickerTests(unittest.TestCase):
         app.uid = 1000
         app.ui = FakeUI()
         self.offered = []
-        app.ui.choose_many = lambda text, items, verb="unmount": \
-            self.offered.append((text, items, verb)) or picked
+        app.ui.choose_with_all = lambda text, items, verb, all_label: \
+            self.offered.append((text, items, verb, all_label)) or picked
         self.mounted = []
         app.mount_one = lambda ref: self.mounted.append(ref) or 0
         mock.patch.object(fsm, "tcp_probe", return_value=None if reachable else "refused").start()
@@ -747,6 +770,7 @@ class SharePickerTests(unittest.TestCase):
         self.assertEqual(app.cmd_mount(), 0)
         self.assertEqual(self.offered[0][0], "Mount which shares on nas.example.net?")
         self.assertEqual(self.offered[0][2], "mount")
+        self.assertEqual(self.offered[0][3], "All 2 shares on nas.example.net")
         self.assertEqual([(r.share, r.user, r.host) for r in self.mounted],
                          [("Media", "jordan", "nas.example.net"), ("Backups", "jordan", "nas.example.net")])
 
