@@ -112,8 +112,9 @@ is_valid_share() {
     [[ $share != -* && $share != . && $share != .. ]] || return 1
 }
 
+# Not starting with "-" (the same rule as the user side).
 is_valid_user() {
-    [[ $1 =~ ^[A-Za-z0-9._@\$-]([A-Za-z0-9._@\$\ -]{0,62}[A-Za-z0-9._@\$-])?$ ]]
+    [[ $1 =~ ^[A-Za-z0-9._@\$]([A-Za-z0-9._@\$\ -]{0,62}[A-Za-z0-9._@\$-])?$ ]]
 }
 
 is_valid_domain() {
@@ -268,10 +269,13 @@ classify_mount_error() {
         return
     fi
     # Only this attempt's lines when they can be told apart (without
-    # journalctl, all of dmesg is read).
+    # journalctl, all of dmesg is read); none when another mount's attempt
+    # is mixed in, since its lines name no server either.
     local text=$kernel
     attempt_lines "$kernel" "$source"
-    if [[ -n $ATTEMPT_FOUND ]]; then
+    if [[ -n $ATTEMPT_FOUND && -n $ATTEMPT_MIXED ]]; then
+        text=""
+    elif [[ -n $ATTEMPT_FOUND ]]; then
         text=$ATTEMPT
     fi
     if [[ $text == *[Dd]"ialect not supported"* || $text == *"protocol negotiation failed"* \

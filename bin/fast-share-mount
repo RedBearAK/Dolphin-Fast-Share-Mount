@@ -107,7 +107,9 @@ class ServerRoot(UsageError):
 # ---- validation (mirrors fast-share-mount-helper; the helper is the authority) ----
 
 _HOST_CHARS = re.compile(r"[A-Za-z0-9.-]+")
-_USER_RE = re.compile(r"[A-Za-z0-9._@$-]([A-Za-z0-9._@$ -]{0,62}[A-Za-z0-9._@$-])?")
+# Not starting with "-": the name is an argument to gdbus, kwallet-query
+# and secret-tool, which would read it as an option.
+_USER_RE = re.compile(r"[A-Za-z0-9._@$]([A-Za-z0-9._@$ -]{0,62}[A-Za-z0-9._@$-])?")
 _DOMAIN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 
 
@@ -201,7 +203,8 @@ def parse_smb_url(url: str) -> ShareRef:
     if not segments:
         # The address for kioclient and the picked shares, without a
         # password (it would be visible in the process list).
-        login = userinfo.split(":", 1)[0] + "@" if has_user else ""
+        login = userinfo.split(":", 1)[0]
+        login = login + "@" if login else ""
         raise ServerRoot(
             f"smb://{host}/ is a server or workgroup, not a share. Open one of its shares first.",
             f"smb://{login}{hostport}/", host, port)
@@ -1333,7 +1336,7 @@ class App:
             values["server_display_name"] = folder_label(ref.host, self.display_name(ref.host)) or host
         args = []
         folder = fill_name(folder_template, values)
-        while len(folder.encode("utf-8")) > 1000:  # the helper takes 1024 bytes and keeps 100
+        while len(folder.encode("utf-8", "surrogateescape")) > 1000:  # the helper takes 1024, keeps 100
             folder = folder[:-1]
         if folder != ref.share:
             args += ["--folder", folder]

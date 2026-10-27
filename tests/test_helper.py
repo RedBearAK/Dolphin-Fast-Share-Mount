@@ -67,6 +67,9 @@ class ValidationTests(unittest.TestCase):
 
     def test_users_agree(self):
         self.check_agreement("is_valid_user", user_side.is_valid_user, USERS)
+        # a leading "-" would be read as an option by gdbus and secret-tool
+        self.assertFalse(valid("is_valid_user", "-dash"))
+        self.assertTrue(valid("is_valid_user", "trail-"))
 
     def test_domains_agree(self):
         self.check_agreement("is_valid_domain", user_side.is_valid_domain, DOMAINS)
@@ -350,6 +353,11 @@ class ErrorTests(unittest.TestCase):
         result = bash('classify_mount_error 32 "$1" "$2" "$3"; printf "%s" "$CLASS_CODE"',
                       "mount error(112): Host is down", refused, self.SOURCE)
         self.assertEqual(result.stdout, "EDIALECT")
+
+    def test_dialect_line_of_another_attempt_does_not_decide(self):
+        kernel = (self.WRONG_PASSWORD + "\n" + self.OTHER +
+                  "\nCIFS: VFS: \\\\127.0.0.1 Dialect not supported by server")
+        self.assertEqual(self.sort_access(kernel)[0], "EAUTH")
 
     def test_fail_line_and_status(self):
         result = bash('fail EAUTH "Login failed" "$1"', "detail with\ttab\nand newline")

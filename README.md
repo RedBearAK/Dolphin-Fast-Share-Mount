@@ -141,7 +141,7 @@ The user name comes from `--user`, else from the address (`smb://user@server/sha
 | `smb_version` | `3.1.1`, `3.0.2`, `3.0`, `3`, `2.1`, `2.0`, `default`, `1.0` | empty: the kernel picks the newest version both sides speak (2.1 or later) |
 | `open_mode` | `tab`, `window`, `none` | `tab` |
 | `remember_password` | `ask`, `always`, `never` | `ask` |
-| `folder_name` | a pattern with `{share}` (required) and any of the server placeholders above, plus letters, digits and `. _ - + @`; `share` is short for `{share}` | `{share}@{server_display_name}` |
+| `folder_name` | a pattern of at most 100 characters with `{share}` (required) and any of the server placeholders above, plus letters, digits and `. _ - + @`; `share` is short for `{share}` | `{share}@{server_display_name}` |
 | `sidebar_name` | `folder_name` (the folder's own name), or quoted text with the same placeholders, such as `"{share} [{server_display_name}]"`; longer than 40 characters, the middle becomes `…` | `folder_name` |
 
 SMB1 (`1.0`) is never used unless you set it here or pass `--vers 1.0`, because it is insecure. A server that only speaks SMB1 produces an error that says so.

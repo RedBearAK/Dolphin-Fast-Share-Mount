@@ -794,6 +794,14 @@ class SharePickerTests(unittest.TestCase):
         self.assertEqual(app.cmd_mount(), 0)
         self.assertEqual(sorted(r.share for r in self.mounted), ["50%25", "A#B", "a b"])
 
+    def test_empty_user_part_gives_a_plain_address(self):
+        try:
+            fsm.parse_smb_url("smb://:hunter2@nas.example.net/")
+        except fsm.ServerRoot as root:
+            self.assertEqual(root.url, "smb://nas.example.net/")
+        else:
+            self.fail("not a server root")
+
     def test_password_in_the_address_is_not_passed_on(self):
         try:
             fsm.parse_smb_url("smb://WORK;jordan:hunter2@nas.example.net:4445/")
@@ -1228,6 +1236,11 @@ class MountFlowTests(unittest.TestCase):
         self.assertEqual(self.names(announced="Evil\tNAS\nnext.host\tX"), ("Media@EvilNASnext.hostX", None))
         with open(fsm.server_names_path(), encoding="utf-8") as handle:
             self.assertEqual(handle.read(), "nas.example.net\tEvilNASnext.hostX\n")
+
+    def test_share_name_with_a_non_utf8_byte_does_not_crash(self):
+        url = os.fsdecode(b"smb://nas.example.net/caf\xe9")
+        folder, _ = self.names(url=url)
+        self.assertEqual(folder, "caf\udce9@Jordan's NAS")
 
     def test_announced_name_is_asked_once_per_run(self):
         app = self.app(FakeUI(passwords=["pw", "pw"]), helper_results=[self.ok(), self.ok()])
