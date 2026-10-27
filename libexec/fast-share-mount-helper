@@ -223,7 +223,7 @@ same_source() {
 # CLASS_CODE and CLASS_MESSAGE.
 CLASS_CODE="" CLASS_MESSAGE=""
 classify_mount_error() {
-    local status=$1 err=$2 kernel=$3 number=""
+    local status=$1 err=$2 kernel=$3 source=${4:-} number=""
     if [[ $err =~ mount\ error\(([0-9]+)\) ]]; then
         number=${BASH_REMATCH[1]}
     fi
@@ -239,8 +239,11 @@ classify_mount_error() {
         return
     fi
     case $number in
-        13)
-            classify_access_error "$kernel"
+        13|127|128)
+            classify_access_error "$number" "$kernel" "$source"
+            ;;
+        5)
+            classify_access_error "$number" "$kernel" "$source" || classify_other_error "$err"
             ;;
         2)
             CLASS_CODE=ENOSHARE
@@ -267,40 +270,83 @@ classify_mount_error() {
             CLASS_MESSAGE="The server refused the connection (operation not permitted)"
             ;;
         *)
-            if [[ $err == *"could not resolve address"* || $err == *"resolve"*"host"* ]]; then
-                CLASS_CODE=EHOST
-                CLASS_MESSAGE="The server name could not be resolved"
-            else
-                CLASS_CODE=EINTERNAL
-                CLASS_MESSAGE="mount.cifs failed"
-            fi
+            classify_other_error "$err"
             ;;
     esac
 }
 
-# mount error 13 (EACCES) covers both a failed login and a share the server
-# refuses after a good login. Only the kernel's lines tell them apart, and
-# only the lines of this attempt count: they start at its "Attempting to
-# mount" line (earlier attempts can fall in the same second). A failed login
-# names its status or reports that the SMB session failed. A refused share
-# shows neither, so it is only concluded when the attempt's last line
-# ("cifs_mount failed ... -13") has reached the journal; otherwise the
-# message stays open to both causes.
-classify_access_error() {
-    local kernel=$1 attempt="" status=""
-    if [[ $kernel == *"Attempting to mount"* ]]; then
-        attempt=${kernel##*Attempting to mount}
+classify_other_error() {
+    local err=$1
+    if [[ $err == *"could not resolve address"* || $err == *"resolve"*"host"* ]]; then
+        CLASS_CODE=EHOST
+        CLASS_MESSAGE="The server name could not be resolved"
+    else
+        CLASS_CODE=EINTERNAL
+        CLASS_MESSAGE="mount.cifs failed"
     fi
-    local text=${attempt:-$kernel}
+}
+
+# The kernel lines of this attempt: those after the last "Attempting to
+# mount SOURCE" line. mount.cifs tries each address of a server in turn, so
+# the last such line is the attempt that failed. ATTEMPT_MIXED is set when
+# another mount's attempt shows up in the window (kernel_cifs_lines turns
+# those into "Attempting to mount (another share)"): its status lines carry
+# no server name and cannot be told from ours.
+ATTEMPT="" ATTEMPT_FOUND="" ATTEMPT_MIXED=""
+attempt_lines() {
+    local kernel=$1 source=$2 line
+    ATTEMPT="" ATTEMPT_FOUND="" ATTEMPT_MIXED=""
+    [[ -n $source ]] || return 0
+    while IFS= read -r line; do
+        if [[ $line == *"Attempting to mount "* ]]; then
+            if [[ ${line##*Attempting to mount } == "$source" ]]; then
+                ATTEMPT="" ATTEMPT_FOUND=1
+            else
+                ATTEMPT_MIXED=1
+            fi
+            continue
+        fi
+        if [[ -n $ATTEMPT_FOUND ]]; then
+            ATTEMPT+="$line"$'\n'
+        fi
+    done <<< "$kernel"
+}
+
+# A failed login and a refused share both end in mount error 13 (EACCES).
+# Only the kernel's lines tell them apart: a failed login names its status
+# or reports that the SMB session failed, a share refused after a good login
+# shows neither. That is only concluded when this attempt's lines are
+# complete (up to "cifs_mount failed ... -13") and no other mount's lines are
+# mixed in; otherwise the message stays open to both causes. Expired and
+# disabled accounts arrive as 127 (EKEYEXPIRED) and 128 (EKEYREVOKED);
+# STATUS_NO_SUCH_USER and STATUS_PASSWORD_MUST_CHANGE as 5 (EIO), which is
+# only an account error when the status says so (returns 1 otherwise).
+classify_access_error() {
+    local number=$1 kernel=$2 source=$3 text="" status=""
+    attempt_lines "$kernel" "$source"
+    if [[ -n $ATTEMPT_FOUND && -z $ATTEMPT_MIXED ]]; then
+        text=$ATTEMPT
+    fi
     if [[ $text =~ STATUS_(ACCOUNT_[A-Z_]+|PASSWORD_EXPIRED|PASSWORD_MUST_CHANGE|INVALID_LOGON_HOURS|INVALID_WORKSTATION) ]]; then
         status=${BASH_REMATCH[0]}
         CLASS_CODE=EDENIED
         CLASS_MESSAGE="The server refused this account ($status)"
-    elif [[ $text == *STATUS_LOGON_FAILURE* || $text == *STATUS_WRONG_PASSWORD* \
-            || $text == *STATUS_NO_SUCH_USER* || $text == *"failed to create a new SMB session"* ]]; then
+    elif [[ $number == 127 ]]; then
+        CLASS_CODE=EDENIED
+        CLASS_MESSAGE="The server refused this account (its password or the account has expired)"
+    elif [[ $number == 128 ]]; then
+        CLASS_CODE=EDENIED
+        CLASS_MESSAGE="The server refused this account (the account is disabled)"
+    elif [[ $text == *STATUS_NO_SUCH_USER* ]]; then
         CLASS_CODE=EAUTH
         CLASS_MESSAGE="Login failed: wrong user name or password"
-    elif [[ -n $attempt && $attempt == *"cifs_mount failed w/return code = -13"* ]]; then
+    elif [[ $number == 5 ]]; then
+        return 1
+    elif [[ $text == *STATUS_LOGON_FAILURE* || $text == *STATUS_WRONG_PASSWORD* \
+            || $text == *"failed to create a new SMB session"* ]]; then
+        CLASS_CODE=EAUTH
+        CLASS_MESSAGE="Login failed: wrong user name or password"
+    elif [[ $text == *"cifs_mount failed w/return code = -13"* ]]; then
         CLASS_CODE=EDENIED
         CLASS_MESSAGE="The login worked, but the server refused access to the share"
     else
@@ -380,8 +426,11 @@ read_password() {
 }
 
 # The last kernel CIFS lines since the attempt started, for the error
-# detail. Lines that name another server (\\server) are left out, so one
-# user's error report does not show other users' servers.
+# detail and for telling error 13 apart. Lines that name another server
+# (\\server) are left out, so one user's error report does not show other
+# users' servers; another server's "Attempting to mount" line is kept as
+# "Attempting to mount (another share)", because the lines after it are not
+# ours. Twelve lines hold a full attempt (up to five) with room for others.
 kernel_cifs_lines() {
     local since=$1 host=$2 line
     {
@@ -394,8 +443,10 @@ kernel_cifs_lines() {
         [[ ${line,,} == *cifs* ]] || continue
         if line_names_only_host "$line" "$host"; then
             printf '%s\n' "$line"
+        elif [[ $line == *"Attempting to mount "* ]]; then
+            printf '%s\n' "CIFS: Attempting to mount (another share)"
         fi
-    done | tail -n 8
+    done | tail -n 12
 }
 
 # True when every server named in LINE (as \\server or //server) is HOST.
@@ -515,7 +566,7 @@ cmd_mount() {
 
     log info "mounting $source at $mountpoint (options: $options)"
     local started err="" status=0 kernel
-    started=$(date +%s)
+    started=$(date +%s.%N)
     if [[ -n $guest ]]; then
         err=$(timeout "$MOUNT_TIMEOUT" mount.cifs "$source" "$mountpoint" -o "$options" 2>&1 >/dev/null) \
             || status=$?
@@ -533,7 +584,7 @@ cmd_mount() {
             timeout "$UMOUNT_TIMEOUT" umount -l -- "$mountpoint" 2>/dev/null || true
         fi
         remove_if_empty "$mountpoint" "$host_dir"
-        classify_mount_error "$status" "$err" "$kernel"
+        classify_mount_error "$status" "$err" "$kernel" "$source"
         fail "$CLASS_CODE" "$CLASS_MESSAGE" "mount.cifs exit $status: $err${kernel:+ | kernel: $kernel}"
     fi
 

@@ -188,7 +188,14 @@ class HelperOutputTests(unittest.TestCase):
             ref, "jordan")
         self.assertEqual((title, body), ("Access denied",
                          "jordan@photos.example.net, share 'Media2': The login worked, but the "
-                         "server refused access to the share (mount error 13)."))
+                         "server refused access to the share."))
+        title, body = fsm.explain(fsm.HelperResult(
+            False, [], "EAUTH", "Login failed: wrong user name or password"), ref, "jordan")
+        self.assertEqual(body, "Login failed for jordan@photos.example.net: wrong user name or password.")
+        title, body = fsm.explain(fsm.HelperResult(
+            False, [], "EAUTH", "Login failed: wrong user name or password, or no access to this share"),
+            ref, "jordan")
+        self.assertIn("or no access to the share 'Media2' (mount error 13)", body)
         title, body = fsm.explain(fsm.HelperResult(
             False, [], "EMISSING", "mount.cifs is missing (package cifs-utils)"), ref, "jordan")
         self.assertEqual(title, "Required component missing")

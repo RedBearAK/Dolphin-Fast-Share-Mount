@@ -189,18 +189,27 @@ class ErrorTests(unittest.TestCase):
 
     # Kernel lines as journalctl printed them on openSUSE (kernel 7.2) for a
     # wrong password and for a share refused after a good login.
+    SOURCE = "//127.0.0.1/Shared"
     WRONG_PASSWORD = ("CIFS: Attempting to mount //127.0.0.1/Shared\n"
                       "CIFS: Status code returned 0xc000006d STATUS_LOGON_FAILURE\n"
                       "CIFS: VFS: \\\\127.0.0.1 failed to create a new SMB session with Unknown: -13\n"
                       "CIFS: VFS: cifs_mount failed w/return code = -13")
     SHARE_REFUSED = ("CIFS: Attempting to mount //127.0.0.1/Shared\n"
                      "CIFS: VFS: cifs_mount failed w/return code = -13")
-    EACCES = "mount error(13): Permission denied"
+    OTHER = "CIFS: Attempting to mount (another share)"
+    OPEN = "Login failed: wrong user name or password, or no access to this share"
+    ERRORS = {13: "mount error(13): Permission denied", 5: "mount error(5): Input/output error",
+              127: "mount error(127): Key has expired", 128: "mount error(128): Key has been revoked"}
 
-    def sort_access(self, kernel):
-        result = bash('classify_mount_error 32 "$1" "$2"; printf "%s|%s" "$CLASS_CODE" "$CLASS_MESSAGE"',
-                      self.EACCES, kernel)
+    def sort_access(self, kernel, number=13, source=SOURCE):
+        result = bash('classify_mount_error 32 "$1" "$2" "$3"; '
+                      'printf "%s|%s" "$CLASS_CODE" "$CLASS_MESSAGE"',
+                      self.ERRORS[number], kernel, source)
         return tuple(result.stdout.split("|", 1))
+
+    @classmethod
+    def with_status(cls, status):
+        return cls.WRONG_PASSWORD.replace("0xc000006d STATUS_LOGON_FAILURE", status)
 
     def test_wrong_password_is_a_failed_login(self):
         self.assertEqual(self.sort_access(self.WRONG_PASSWORD),
@@ -215,32 +224,74 @@ class ErrorTests(unittest.TestCase):
         self.assertEqual(self.sort_access(self.SHARE_REFUSED),
                          ("EDENIED", "The login worked, but the server refused access to the share"))
 
-    def test_earlier_attempt_in_the_same_second_does_not_count(self):
+    def test_only_the_last_attempt_of_this_share_counts(self):
+        # an earlier attempt of ours (another address of the server) failed
+        # differently; without the slice its account status would win
+        earlier = self.with_status("0xc0000234 STATUS_ACCOUNT_LOCKED_OUT")
+        self.assertEqual(self.sort_access(earlier + "\n" + self.WRONG_PASSWORD),
+                         ("EAUTH", "Login failed: wrong user name or password"))
         self.assertEqual(self.sort_access(self.WRONG_PASSWORD + "\n" + self.SHARE_REFUSED)[0],
                          "EDENIED")
-        self.assertEqual(self.sort_access(self.SHARE_REFUSED + "\n" + self.WRONG_PASSWORD)[0],
-                         "EAUTH")
+
+    def test_anchor_is_the_whole_source_not_a_prefix(self):
+        kernel = self.SHARE_REFUSED.replace("//127.0.0.1/Shared", "//127.0.0.1/SharedMore")
+        self.assertEqual(self.sort_access(kernel), ("EAUTH", self.OPEN))
+
+    def test_another_mount_in_the_window_keeps_the_message_open(self):
+        locked_elsewhere = (self.OTHER + "\nCIFS: Status code returned 0xc0000234 "
+                            "STATUS_ACCOUNT_LOCKED_OUT\n")
+        # another server's account error after our attempt started
+        mixed = self.WRONG_PASSWORD.replace("CIFS: VFS: cifs_mount", locked_elsewhere + "CIFS: VFS: cifs_mount")
+        self.assertEqual(self.sort_access(mixed), ("EAUTH", self.OPEN))
+        # another attempt that started just before ours, its status after our anchor
+        mixed = self.OTHER + "\n" + self.SHARE_REFUSED.replace(
+            "CIFS: VFS: cifs_mount", "CIFS: Status code returned 0xc000006d STATUS_LOGON_FAILURE\n"
+                                     "CIFS: VFS: cifs_mount")
+        self.assertEqual(self.sort_access(mixed), ("EAUTH", self.OPEN))
+        # a refused share while another server's login fails
+        self.assertEqual(self.sort_access(self.SHARE_REFUSED + "\n" + self.OTHER +
+                                          "\nCIFS: Status code returned 0xc000006d STATUS_LOGON_FAILURE"),
+                         ("EAUTH", self.OPEN))
 
     def test_refused_account_names_its_status(self):
-        kernel = self.WRONG_PASSWORD.replace("0xc000006d STATUS_LOGON_FAILURE",
-                                             "0xc0000234 STATUS_ACCOUNT_LOCKED_OUT")
-        self.assertEqual(self.sort_access(kernel),
-                         ("EDENIED", "The server refused this account (STATUS_ACCOUNT_LOCKED_OUT)"))
-        kernel = self.WRONG_PASSWORD.replace("0xc000006d STATUS_LOGON_FAILURE",
-                                             "0xc0000071 STATUS_PASSWORD_EXPIRED")
-        self.assertEqual(self.sort_access(kernel)[1],
-                         "The server refused this account (STATUS_PASSWORD_EXPIRED)")
+        for status in ("STATUS_ACCOUNT_LOCKED_OUT", "STATUS_ACCOUNT_RESTRICTION",
+                       "STATUS_INVALID_LOGON_HOURS", "STATUS_INVALID_WORKSTATION"):
+            self.assertEqual(self.sort_access(self.with_status(f"0xc0000000 {status}")),
+                             ("EDENIED", f"The server refused this account ({status})"))
+
+    def test_expired_and_disabled_accounts_arrive_with_their_own_numbers(self):
+        for number, status in ((127, "STATUS_PASSWORD_EXPIRED"), (127, "STATUS_ACCOUNT_EXPIRED"),
+                               (128, "STATUS_ACCOUNT_DISABLED"), (5, "STATUS_PASSWORD_MUST_CHANGE")):
+            kernel = self.with_status(f"0xc0000000 {status}").replace("-13", f"-{number}")
+            self.assertEqual(self.sort_access(kernel, number),
+                             ("EDENIED", f"The server refused this account ({status})"))
+        # without usable kernel lines the number alone still says enough
+        self.assertEqual(self.sort_access("", 127),
+                         ("EDENIED", "The server refused this account "
+                                     "(its password or the account has expired)"))
+        self.assertEqual(self.sort_access("", 128),
+                         ("EDENIED", "The server refused this account (the account is disabled)"))
+
+    def test_input_output_error_is_an_account_error_only_when_the_status_says_so(self):
+        kernel = self.with_status("0xc0000064 STATUS_NO_SUCH_USER").replace("-13", "-5")
+        self.assertEqual(self.sort_access(kernel, 5),
+                         ("EAUTH", "Login failed: wrong user name or password"))
+        session_only = self.WRONG_PASSWORD.replace(
+            "CIFS: Status code returned 0xc000006d STATUS_LOGON_FAILURE\n", "").replace("-13", "-5")
+        self.assertEqual(self.sort_access(session_only, 5), ("EINTERNAL", "mount.cifs failed"))
+        self.assertEqual(self.sort_access("", 5), ("EINTERNAL", "mount.cifs failed"))
 
     def test_incomplete_or_missing_kernel_lines_stay_open_to_both_causes(self):
-        open_message = "Login failed: wrong user name or password, or no access to this share"
         # the attempt's last line has not reached the journal yet
         self.assertEqual(self.sort_access("CIFS: Attempting to mount //127.0.0.1/Shared"),
-                         ("EAUTH", open_message))
+                         ("EAUTH", self.OPEN))
         # no kernel lines at all (journal unreadable)
-        self.assertEqual(self.sort_access(""), ("EAUTH", open_message))
+        self.assertEqual(self.sort_access(""), ("EAUTH", self.OPEN))
         # lines without the attempt's start (cut off) do not prove a refused share
         self.assertEqual(self.sort_access("CIFS: VFS: cifs_mount failed w/return code = -13"),
-                         ("EAUTH", open_message))
+                         ("EAUTH", self.OPEN))
+        # no source given: nothing can be anchored
+        self.assertEqual(self.sort_access(self.SHARE_REFUSED, source=""), ("EAUTH", self.OPEN))
 
     def test_refused_share_exit_status(self):
         result = bash('fail EDENIED "x"')
@@ -572,9 +623,38 @@ class KernelLineTests(unittest.TestCase):
         result = bash('timeout() { shift; "$@"; }; journalctl() { printf "%s" "$LINES"; }; '
                       'kernel_cifs_lines 0 nas', env={"LINES": lines})
         self.assertEqual(result.stdout.splitlines(), [
+            "CIFS: Attempting to mount (another share)",
             "CIFS: VFS: \\\\NAS Dialect not supported",
             "CIFS: VFS: cifs_mount failed w/return code = -112",
         ])
+
+
+class KernelLineAttemptTests(unittest.TestCase):
+    def read(self, lines):
+        return bash('timeout() { shift; "$@"; }; journalctl() { printf "%s" "$LINES"; }; '
+                    'kernel_cifs_lines 0 nas', env={"LINES": lines}).stdout.splitlines()
+
+    def test_another_servers_attempt_is_kept_without_its_name(self):
+        lines = ("CIFS: Attempting to mount //nas/Media\n"
+                 "CIFS: Attempting to mount //hr-secrets.example/Payroll\n"
+                 "CIFS: Status code returned 0xc000006d STATUS_LOGON_FAILURE\n")
+        self.assertEqual(self.read(lines), [
+            "CIFS: Attempting to mount //nas/Media",
+            "CIFS: Attempting to mount (another share)",
+            "CIFS: Status code returned 0xc000006d STATUS_LOGON_FAILURE",
+        ])
+
+    def test_a_full_attempt_survives_noise_before_it(self):
+        noise = "CIFS: VFS: cifs_mount failed w/return code = -2\n" * 20
+        attempt = ("CIFS: No dialect specified on mount.\n"
+                   "CIFS: Attempting to mount //nas/Media\n"
+                   "CIFS: Status code returned 0xc000006d STATUS_LOGON_FAILURE\n"
+                   "CIFS: VFS: \\\\nas failed to create a new SMB session with Unknown: -13\n"
+                   "CIFS: VFS: \\\\nas Send error in SessSetup = -13\n"
+                   "CIFS: VFS: cifs_mount failed w/return code = -13\n")
+        kept = self.read(noise + attempt)
+        self.assertEqual(len(kept), 12)
+        self.assertEqual(kept[-6:], attempt.splitlines())
 
 
 class KernelLineExitTests(unittest.TestCase):
