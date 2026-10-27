@@ -79,7 +79,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config["user"], "jordan")
         self.assertEqual(config["open_mode"], "window")
         self.assertEqual(config["remember_password"], "ask")
-        self.assertEqual(config["folder_name"], "{share}@{server}")
+        self.assertEqual(config["folder_name"], "{share}@{server_display_name}")
         self.assertEqual(config["sidebar_name"], "folder_name")
         self.assertEqual(warnings, [])
 
@@ -853,33 +853,35 @@ class NameSettingTests(unittest.TestCase):
         return fsm.parse_config(line + "\n")
 
     def test_folder_name_templates_and_aliases(self):
-        for value, expected in (("{share}@{server}", "{share}@{server}"), ("share", "{share}"),
-                                ("server-share", "{server}-{share}"), ("{share}+{server}", "{share}+{server}"),
-                                ("{server}_{share}", "{server}_{share}")):
+        for value, expected in (("{share}@{server_display_name}", "{share}@{server_display_name}"), ("share", "{share}"),
+                                ("server-share", "{server_display_name}-{share}"), ("{share}+{server_address}", "{share}+{server_address}"),
+                                ("{server_short_name}_{share}", "{server_short_name}_{share}")):
             config, warnings = self.parse(f"folder_name={value}")
             self.assertEqual((config["folder_name"], warnings), (expected, []), value)
 
     def test_bad_folder_names_are_refused_with_a_warning(self):
-        for value in ("{server}", "{share} [{server}]", "{share}/{server}", "{share}:{server}",
-                      "{Share}", ""):
+        for value in ("{server_address}", "{server_display_name}@{server_short_name}", "{share} [{server_display_name}]", "{share}/{server_address}",
+                      "{share}:{server_short_name}", "{Share}", "{share}@{nick}", ""):
             config, warnings = self.parse(f"folder_name={value}")
-            self.assertEqual(config["folder_name"], "{share}@{server}", value)
+            self.assertEqual(config["folder_name"], "{share}@{server_display_name}", value)
             self.assertEqual(len(warnings), 1, value)
             self.assertIn("needs {share}", warnings[0])
 
     def test_sidebar_name_is_folder_name_or_quoted_text(self):
-        for value, expected in (("folder_name", "folder_name"), ('"{share} [{server}]"', '"{share} [{server}]"'),
-                                ("'{share} on {server}'", '"{share} on {server}"')):
+        for value, expected in (("folder_name", "folder_name"), ('"{share} [{server_address}]"', '"{share} [{server_address}]"'),
+                                ("'{share} on {server_address}'", '"{share} on {server_address}"')):
             config, warnings = self.parse(f"sidebar_name={value}")
             self.assertEqual((config["sidebar_name"], warnings), (expected, []), value)
-        for value in ("{share} [{server}]", '"unclosed', '""', '"  "', "'mixed\"", "Folder_Name"):
+        for value in ("{share} [{server_address}]", '"unclosed', '""', '"  "', "'mixed\"", "Folder_Name"):
             config, warnings = self.parse(f"sidebar_name={value}")
             self.assertEqual(config["sidebar_name"], "folder_name", value)
             self.assertEqual(len(warnings), 1, value)
 
     def test_fill_name_is_one_pass(self):
-        self.assertEqual(fsm.fill_name("{share}@{server}", "Media", "{share}"), "Media@{share}")
-        self.assertEqual(fsm.fill_name("{share}@{server}", "{server}", "Nas"), "{server}@Nas")
+        values = {"share": "{server_address}", "server_address": "{share}",
+                  "server_display_name": "{server_short_name}", "server_short_name": "{server_display_name}"}
+        self.assertEqual(fsm.fill_name("{share}@{server_address}-{server_display_name}+{server_short_name}", values),
+                         "{server_address}@{share}-{server_short_name}+{server_display_name}")
 
     def test_middle_ellipsis(self):
         self.assertEqual(fsm.middle_ellipsis("short"), "short")
@@ -1165,24 +1167,33 @@ class MountFlowTests(unittest.TestCase):
         if sidebar_name is not None:
             app.config["sidebar_name"] = sidebar_name
         self.assertEqual(app.mount_one(fsm.parse_smb_url(url)), 0)
+        self.looked_up = fsm.server_display_name.called
         args = app.elevator.run_helper.call_args.args[1]
         pick = lambda option: args[args.index(option) + 1] if option in args else None
         return pick("--folder"), pick("--sidebar")
 
-    def test_default_is_share_at_server_and_sidebar_follows(self):
+    def test_default_is_share_at_name_and_sidebar_follows(self):
         self.assertEqual(self.names(), ("Media@Jordan's NAS", None))
         self.assertEqual(self.names(announced=None), ("Media@nas", None))
 
-    def test_other_templates(self):
-        self.assertEqual(self.names("{server}-{share}"), ("Jordan's NAS-Media", None))
-        self.assertEqual(self.names("{share}"), (None, None))
-        fsm.server_display_name.reset_mock()
-        self.assertEqual(self.names("{share}", '"{share} [{server}]"'), (None, "Media [Jordan's NAS]"))
-        self.assertEqual(self.names("{share}", '"just {share}"'), (None, "just Media"))
-        fsm.server_display_name.assert_not_called()
+    def test_server_name_and_host_are_different_things(self):
+        self.assertEqual(self.names("{share}@{server_address}"), ("Media@nas.example.net", None))
+        self.assertEqual(self.names("{share}@{server_short_name}"), ("Media@nas", None))
+        self.assertEqual(self.names("{server_display_name}-{share}"), ("Jordan's NAS-Media", None))
+        self.assertEqual(self.names("{share}", '"{share} on {server_display_name} ({server_address}, {server_short_name})"'),
+                         (None, fsm.middle_ellipsis("Media on Jordan's NAS (nas.example.net, nas)")))
+        self.assertEqual(self.names("{share}@{server_short_name}", url="smb://192.0.2.7/Media"), ("Media@192.0.2.7", None))
+
+    def test_network_lookup_only_for_name(self):
+        for folder, sidebar in (("{share}", None), ("{share}@{server_address}", '"{share} [{server_short_name}]"'),
+                                ("{share}", '"just {share}"')):
+            self.names(folder, sidebar)
+            self.assertFalse(self.looked_up, (folder, sidebar))
+        self.names("{share}", '"{share} [{server_display_name}]"')
+        self.assertTrue(self.looked_up)
 
     def test_long_sidebar_names_keep_both_ends(self):
-        folder, sidebar = self.names("{share}", '"{share} on {server}"',
+        folder, sidebar = self.names("{share}", '"{share} on {server_display_name}"',
                                      announced="A Very Long Server Name For Testing",
                                      url="smb://nas/Quarterly_Reports_Archive")
         self.assertEqual(len(sidebar), 40)

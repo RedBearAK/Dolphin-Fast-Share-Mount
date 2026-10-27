@@ -56,7 +56,7 @@ DEFAULT_CONFIG = {
     "smb_version": "",
     "open_mode": "tab",
     "remember_password": "ask",
-    "folder_name": "{share}@{server}",
+    "folder_name": "{share}@{server_display_name}",
     "sidebar_name": "folder_name",
 }
 CONFIG_CHOICES = {
@@ -64,16 +64,22 @@ CONFIG_CHOICES = {
     "open_mode": ("tab", "window", "none"),
     "remember_password": ("ask", "always", "never"),
 }
-FOLDER_NAME_ALIASES = {"server-share": "{server}-{share}", "share": "{share}"}
+FOLDER_NAME_ALIASES = {"server-share": "{server_display_name}-{share}", "share": "{share}"}
 SIDEBAR_NAME_LIMIT = 40
-_FOLDER_TEMPLATE = re.compile(r"(?:\{share\}|\{server\}|[A-Za-z0-9._+@-])+")
-_PLACEHOLDER = re.compile(r"\{(share|server)\}")
+# {share}: the share. {server_address}: the server as in the address
+# (photos.local, photos.example.net or an IP address). {server_display_name}:
+# the name it announces, shown in Dolphin's network view (Photos), else the
+# short name. {server_short_name}: the first part of the server's name
+# (photos); an IP address stays whole.
+PLACEHOLDERS = ("share", "server_address", "server_display_name", "server_short_name")
+_PLACEHOLDER = re.compile(r"\{(" + "|".join(PLACEHOLDERS) + r")\}")
+_FOLDER_TEMPLATE = re.compile(r"(?:\{(?:" + "|".join(PLACEHOLDERS) + r")\}|[A-Za-z0-9._+@-])+")
 
 
-def fill_name(template: str, share: str, server: str) -> str:
-    """TEMPLATE with {share} and {server} replaced (in one pass, so a server
-    called "{share}" stays literal)."""
-    return _PLACEHOLDER.sub(lambda m: share if m.group(1) == "share" else server, template)
+def fill_name(template: str, values: dict) -> str:
+    """TEMPLATE with the PLACEHOLDERS replaced from VALUES
+    (in one pass, so a value that reads "{share}" stays literal)."""
+    return _PLACEHOLDER.sub(lambda m: values[m.group(1)], template)
 
 
 def middle_ellipsis(text: str, limit: int = SIDEBAR_NAME_LIMIT) -> str:
@@ -257,7 +263,9 @@ def parse_config(text: str) -> tuple:
             if not _FOLDER_TEMPLATE.fullmatch(value) or "{share}" not in value:
                 warnings.append(
                     f"line {number}: folder_name '{value}' needs {{share}} and may hold only "
-                    f"{{server}}, letters, digits and . _ - + @; keeping '{config[key]}'")
+                    f"{{server_address}}, {{server_display_name}}, {{server_short_name}}, "
+                    f"letters, digits and . _ - + @; "
+                    f"keeping '{config[key]}'")
                 continue
         if key == "sidebar_name" and value != "folder_name":
             quoted = len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'"
@@ -265,7 +273,7 @@ def parse_config(text: str) -> tuple:
             if not quoted or not text.strip() or not text.isprintable():
                 warnings.append(
                     f"line {number}: sidebar_name must be folder_name or quoted text such as "
-                    f"\"{{share}} [{{server}}]\"; keeping {config[key]}")
+                    f"\"{{share}} [{{server_display_name}}]\"; keeping {config[key]}")
                 continue
             value = '"' + text + '"'
         if key == "user" and value and not is_valid_user(value):
@@ -1276,15 +1284,17 @@ class App:
         folder_template = self.config["folder_name"]
         sidebar = self.config["sidebar_name"]
         sidebar_template = None if sidebar == "folder_name" else sidebar[1:-1]
-        server = ""
-        if "{server}" in folder_template + (sidebar_template or ""):
-            server = folder_label(ref.host, server_display_name(ref.host)) or ref.host
+        host = folder_label(ref.host, None) or ref.host
+        values = {"share": ref.share, "server_address": ref.host,
+                  "server_short_name": host, "server_display_name": host}
+        if "{server_display_name}" in folder_template + (sidebar_template or ""):
+            values["server_display_name"] = folder_label(ref.host, server_display_name(ref.host)) or host
         args = []
-        folder = fill_name(folder_template, ref.share, server)
+        folder = fill_name(folder_template, values)
         if folder != ref.share:
             args += ["--folder", folder]
         if sidebar_template is not None:
-            text = middle_ellipsis(fill_name(sidebar_template, ref.share, server).strip())
+            text = middle_ellipsis(fill_name(sidebar_template, values).strip())
             args += ["--sidebar", "".join(ch for ch in text if ch.isprintable())]
         return args
 

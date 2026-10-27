@@ -22,16 +22,21 @@
 # Save a password you typed: ask, always, or never.
 #remember_password=ask
 
-# Name of the mount folder: a pattern with {share} (required) and {server},
-# the name the server announces in Dolphin's network view (else the first
-# part of its host name). Besides those, only letters, digits and . _ - + @
-# (nothing that needs quoting in a shell). Examples: {share}@{server}
-# ("Backups@Photos"), {server}-{share}, {share}+{server}, {share}.
-#folder_name={share}@{server}
+# Name of the mount folder: a pattern with {share} (required) and any of
+#   {server_address}       the server as in the address (photos.local)
+#   {server_display_name}  the name it announces, shown in Dolphin's
+#                          network view (Photos), else the short name
+#   {server_short_name}    the first part of the server's name (photos)
+# Besides those, only letters, digits and . _ - + @ (nothing that needs
+# quoting in a shell). Examples: {share}@{server_display_name}
+# ("Backups@Photos"), {server_short_name}-{share}, {share}+{server_address},
+# {share}.
+#folder_name={share}@{server_display_name}
 
 # Name in Dolphin's sidebar: folder_name (the same as the folder), or
-# quoted text with the same placeholders, such as "{share} [{server}]" or
-# "{share} on {server}". Over 40 characters, the middle becomes "…".
+# quoted text with the same placeholders, such as
+# "{share} [{server_display_name}]" or "{share} on {server_address}".
+# Over 40 characters, the middle becomes "…".
 #sidebar_name=folder_name
 
 # End of File #
