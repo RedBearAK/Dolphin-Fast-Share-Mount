@@ -366,6 +366,15 @@ class CommandLineTests(unittest.TestCase):
             self.assertIn(row, result.stdout + result.stderr)
         self.assertNotIn("Unexpected error", result.stderr)
 
+    def test_check_asks_plasmashell_off_screen(self):
+        with mock.patch.object(fsm, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as ran, \
+                mock.patch.object(fsm, "which", lambda name: f"/usr/bin/{name}"), \
+                mock.patch.object(fsm, "PasswordStore"), mock.patch("sys.stdout", new_callable=io.StringIO):
+            fsm.App(fsm.build_parser().parse_args(["check"])).cmd_check()
+        calls = [c for c in ran.call_args_list if c.args[0][0].endswith("plasmashell")]
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].kwargs["env"]["QT_QPA_PLATFORM"], "offscreen")
+
     def test_choose_with_nothing_mounted(self):
         result = self.run_cli("unmount", "--choose", "/tmp")
         self.assertEqual(result.returncode, 0, result.stderr)

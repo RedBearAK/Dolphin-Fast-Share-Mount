@@ -1752,7 +1752,10 @@ class App:
 
         plasma = os.environ.get("KDE_SESSION_VERSION", "")
         shell = which("plasmashell")
-        detail = run([shell, "--version"], timeout=10).stdout.strip() if shell else ""
+        # Off-screen: without a display (a test run, a remote shell) Qt would
+        # abort plasmashell, and the crash handler would report it.
+        detail = run([shell, "--version"], timeout=10,
+                     env=dict(os.environ, QT_QPA_PLATFORM="offscreen")).stdout.strip() if shell else ""
         row("Plasma", plasma or "?", (detail or "plasmashell not found")
             + ("; Plasma 5 older than 5.22 (KF 5.85) is not supported" if plasma == "5" else ""))
         release = os_release()
