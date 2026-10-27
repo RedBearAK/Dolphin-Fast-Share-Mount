@@ -17,6 +17,7 @@ SPDX-License-Identifier: GPL-3.0-or-later
 """
 
 import argparse
+import ast
 import functools
 import getpass
 import os
@@ -469,6 +470,46 @@ def run(argv: list, input_text: str | None = None, timeout: int = 30,
         return subprocess.CompletedProcess(argv, 124, "", f"{argv[0]}: timed out")
 
 
+def kio_fuse_folder(text: str) -> str | None:
+    """The path, when TEXT (a path or file:// URL) lies inside a kio-fuse mount."""
+    if text.startswith("file://"):
+        text = urllib.parse.unquote(urllib.parse.urlsplit(text).path)
+    if not text.startswith("/"):
+        return None
+    path = os.path.normpath(text)
+    runtime = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    if re.match(re.escape(os.path.normpath(runtime)) + r"/kio-fuse-[^/]+/", path + "/"):
+        return path
+    return None
+
+
+def remote_url(text: str) -> str:
+    """TEXT, or the smb:// address behind it when it is a kio-fuse path.
+
+    With kio-fuse running, KIO can hand a service menu a local path such as
+    /run/user/1000/kio-fuse-AbCdEf/smb/jordan@nas/Media instead of the URL;
+    kio-fuse itself says which URL the path stands for."""
+    path = kio_fuse_folder(text)
+    if path is None:
+        return text
+    result = run(["gdbus", "call", "--session", "--dest", "org.kde.KIOFuse",
+                  "--object-path", "/org/kde/KIOFuse",
+                  "--method", "org.kde.KIOFuse.VFS.remoteUrl", path], timeout=10)
+    reply = None
+    if result.returncode == 0:
+        try:
+            value = ast.literal_eval(result.stdout.strip())
+        except (ValueError, SyntaxError):
+            value = None
+        if isinstance(value, tuple) and len(value) == 1 and isinstance(value[0], str):
+            reply = value[0]
+    if not reply:
+        detail = result.stderr.strip() or result.stdout.strip()
+        raise UsageError(f"{path} is a kio-fuse folder, and kio-fuse did not say which "
+                         f"address it stands for ({detail or 'no reply'})")
+    return reply
+
+
 class UI:
     """Notifications and dialogs in a desktop session; plain text in a terminal."""
 
@@ -912,7 +953,7 @@ class App:
         refs, status = [], 0
         for url in self.args.urls:
             try:
-                ref = parse_smb_url(url)
+                ref = parse_smb_url(remote_url(url))
             except UsageError as error:
                 self.ui.error("Cannot mount this location", str(error))
                 status = 2

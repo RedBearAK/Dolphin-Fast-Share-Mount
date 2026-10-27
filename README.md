@@ -18,6 +18,8 @@ Right-click a folder, or the empty background of a folder, in an `smb://` locati
 - **Fast share mount → Mount here (fast)** mounts the share and opens the same folder on the mount, in a new tab (or wherever your Dolphin settings open external folders).
 - **Fast share mount → Mount here (fast), new window** does the same in a new window.
 
+When kio-fuse is running, Dolphin may hand the menu a kio-fuse folder (`/run/user/<uid>/kio-fuse-…/smb/…`) instead of the `smb://` address; the tool asks kio-fuse which address the folder stands for and mounts that.
+
 Right-click a folder on the mount (any local folder shows the entry; it explains itself when used elsewhere):
 
 - **Fast share mount → Unmount fast share mount**

@@ -387,6 +387,81 @@ class OutputTests(unittest.TestCase):
             self.assertEqual(listed.returncode, 0, listed.stderr)
 
 
+class KioFuseTests(unittest.TestCase):
+    """kio-fuse paths that KIO hands to the service menu instead of smb:// URLs."""
+
+    RUNTIME = "/run/user/1000"
+    FOLDER = "/run/user/1000/kio-fuse-AbCdEf/smb/jordan@nas.example.net/Media/Films"
+
+    def setUp(self):
+        mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": self.RUNTIME}).start()
+        self.run = mock.patch.object(fsm, "run").start()
+        self.addCleanup(mock.patch.stopall)
+
+    def reply(self, stdout, returncode=0, stderr=""):
+        self.run.return_value = subprocess.CompletedProcess([], returncode, stdout, stderr)
+
+    def test_fuse_path_becomes_its_smb_address(self):
+        self.reply("('smb://jordan@nas.example.net/Media/Films',)\n")
+        ref = fsm.parse_smb_url(fsm.remote_url(self.FOLDER))
+        self.assertEqual((ref.user, ref.host, ref.share, ref.subpath),
+                         ("jordan", "nas.example.net", "Media", ("Films",)))
+        argv = self.run.call_args.args[0]
+        self.assertEqual(argv[0], "gdbus")
+        self.assertIn("org.kde.KIOFuse.VFS.remoteUrl", argv)
+        self.assertEqual(argv[-1], self.FOLDER)
+
+    def test_fuse_file_url_is_decoded_before_asking(self):
+        self.reply("('smb://nas.example.net/Media/My Films',)")
+        url = "file:///run/user/1000/kio-fuse-AbCdEf/smb/nas.example.net/Media/My%20Films"
+        self.assertEqual(fsm.remote_url(url), "smb://nas.example.net/Media/My Films")
+        self.assertEqual(self.run.call_args.args[0][-1],
+                         "/run/user/1000/kio-fuse-AbCdEf/smb/nas.example.net/Media/My Films")
+
+    def test_reply_in_double_quotes(self):
+        self.reply('("smb://nas.example.net/Media/Jordan\'s",)')
+        self.assertEqual(fsm.remote_url(self.FOLDER), "smb://nas.example.net/Media/Jordan's")
+
+    def test_other_locations_are_left_alone(self):
+        for text in ("smb://nas.example.net/Media", "/home/jordan/Films",
+                     "/tmp/kio-fuse-AbCdEf/smb/nas/Media",
+                     "/run/user/1000/kio-fuse-AbCdEf/../../../../etc",
+                     "/run/user/10000/kio-fuse-AbCdEf/smb/nas/Media"):
+            self.assertEqual(fsm.remote_url(text), text)
+        self.run.assert_not_called()
+
+    def test_no_answer_from_kio_fuse_is_an_error_naming_the_path(self):
+        self.reply("", returncode=1, stderr="Error: GDBus.Error:org.kde.KIOFuse.VFS.Error."
+                                            "RemoteURLNotFound: no remote URL")
+        with self.assertRaises(fsm.UsageError) as caught:
+            fsm.remote_url(self.FOLDER)
+        self.assertIn(self.FOLDER, str(caught.exception))
+        self.assertIn("RemoteURLNotFound", str(caught.exception))
+
+    def test_unreadable_reply_is_an_error(self):
+        for stdout in ("garbage", "('one', 'two')", "(42,)", "('',)"):
+            self.reply(stdout)
+            with self.assertRaises(fsm.UsageError):
+                fsm.remote_url(self.FOLDER)
+
+    def test_fuse_path_of_another_protocol_is_refused_by_the_parser(self):
+        self.reply("('sftp://jordan@nas.example.net/home',)")
+        with self.assertRaises(fsm.UsageError) as caught:
+            fsm.parse_smb_url(fsm.remote_url(self.FOLDER.replace("/smb/", "/sftp/")))
+        self.assertIn("Not an smb:// address", str(caught.exception))
+
+    def test_mount_command_mounts_the_share_behind_a_fuse_path(self):
+        self.reply("('smb://jordan@nas.example.net/Media/Films',)")
+        args = fsm.build_parser().parse_args(["mount", "--no-open", self.FOLDER])
+        app = fsm.App(args)
+        app.ui = FakeUI()
+        with mock.patch.object(app, "mount_one", return_value=0) as mount_one:
+            self.assertEqual(app.cmd_mount(), 0)
+        ref = mount_one.call_args.args[0]
+        self.assertEqual((ref.host, ref.share, ref.user), ("nas.example.net", "Media", "jordan"))
+        self.assertEqual(app.ui.errors, [])
+
+
 class FakeUI:
     def __init__(self, passwords=(), yes=False):
         self.passwords = list(passwords)
