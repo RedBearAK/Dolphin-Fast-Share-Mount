@@ -53,6 +53,9 @@ class UserPartTests(unittest.TestCase):
             "PATH": "/usr/local/bin:/usr/bin:/bin",
             "XDG_RUNTIME_DIR": os.path.join(self.tmp.name, "runtime"),
             "DBUS_SESSION_BUS_ADDRESS": "unix:path=/nonexistent",
+            # The uninstaller runs "fast-share-mount unmount --all"; with an
+            # empty mount table it never reaches a real helper.
+            "FAST_SHARE_MOUNT_MOUNTINFO": "/dev/null",
         }
         os.makedirs(self.env["XDG_RUNTIME_DIR"], mode=0o700)
         self.command = os.path.join(self.home, ".local/bin/fast-share-mount")
@@ -106,11 +109,11 @@ class UserPartTests(unittest.TestCase):
     def test_settings_are_kept(self):
         self.install()
         with open(self.config, "w", encoding="utf-8") as handle:
-            handle.write("user=kkf\n")
+            handle.write("user=jordan\n")
         result = self.install()
         self.assertIn("kept your settings", result.stdout)
         with open(self.config, encoding="utf-8") as handle:
-            self.assertEqual(handle.read(), "user=kkf\n")
+            self.assertEqual(handle.read(), "user=jordan\n")
 
     def test_reinstall_repairs_damage(self):
         self.install()
@@ -123,12 +126,16 @@ class UserPartTests(unittest.TestCase):
         old_file = os.path.join(self.home, ".local/bin/fast-share-mount-old")
         with open(old_file, "w", encoding="utf-8") as handle:
             handle.write("from an older version")
+        outside = os.path.join(self.home, "Documents", "notes.txt")
+        os.makedirs(os.path.dirname(outside))
+        with open(outside, "w", encoding="utf-8") as handle:
+            handle.write("the user's own file")
         with open(os.path.join(self.own_dir, "installed-files.txt"), "a", encoding="utf-8") as handle:
-            handle.write(old_file + "\n/etc/passwd\n")
+            handle.write(f"{old_file}\n{outside}\n")
         self.install()
         self.assert_installed()
         self.assertFalse(os.path.exists(old_file), "file from the old manifest not pruned")
-        self.assertTrue(os.path.exists("/etc/passwd"))
+        self.assertTrue(os.path.exists(outside), "a listed file outside the tool's folders was removed")
         with open(os.path.join(self.own_dir, "uninstall.sh"), encoding="utf-8") as handle:
             self.assertTrue(handle.read().startswith("#!/bin/bash"))
 
@@ -155,6 +162,35 @@ class UserPartTests(unittest.TestCase):
         result = self.script(os.path.join(self.own_dir, "uninstall.sh"), "--user-only")
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
         self.assertEqual(all_files(self.home), [])
+
+    def test_uninstall_stays_inside_its_folders(self):
+        self.install()
+        outside = os.path.join(self.home, "Documents", "notes.txt")
+        os.makedirs(os.path.dirname(outside))
+        with open(outside, "w", encoding="utf-8") as handle:
+            handle.write("the user's own file")
+        with open(os.path.join(self.own_dir, "installed-files.txt"), "a", encoding="utf-8") as handle:
+            handle.write(outside + "\n")
+        result = self.uninstall()
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertEqual(all_files(self.home), ["Documents/notes.txt"])
+
+    def test_uninstall_removes_the_lock_file(self):
+        self.install()
+        lock = os.path.join(self.env["XDG_RUNTIME_DIR"], f"{APP_ID}.lock")
+        with open(lock, "w", encoding="utf-8"):
+            pass
+        result = self.uninstall()
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertFalse(os.path.exists(lock))
+
+    def test_percent_in_home_is_refused(self):
+        home = os.path.join(self.tmp.name, "h%f")
+        os.makedirs(home)
+        self.env["HOME"] = home
+        result = self.script(INSTALLER, "--user-only")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("characters this installer does not handle", result.stderr)
 
     def test_uninstall_keep_config(self):
         self.install()

@@ -44,7 +44,7 @@ warn() { printf 'Warning: %s\n' "$*" >&2; FAILED=1; }
 die() { printf 'Error: %s\n' "$*" >&2; exit 1; }
 
 usage() {
-    sed -n '3,24p' "$SCRIPT" | sed 's/^# \{0,1\}//'
+    sed -n '3,22p' "$SCRIPT" | sed 's/^# \{0,1\}//'
 }
 
 remove_file() {
@@ -76,7 +76,11 @@ remove_listed() {
         for root in "$@"; do
             [[ $path == "$root"/* && $path != *"/../"* ]] && allowed=1 && break
         done
-        [[ -n $allowed ]] && remove_file "$path"
+        if [[ -n $allowed ]]; then
+            remove_file "$path"
+        else
+            say "  left $path alone (outside the tool's folders)"
+        fi
     done < "$manifest"
 }
 
@@ -198,14 +202,16 @@ uninstall_user() {
     fi
     if [[ -z $KEEP_PASSWORDS ]]; then
         if [[ -x $command ]]; then
-            "$command" forget --all >/dev/null 2>&1 || true
+            local result
+            result=$("$command" forget --all 2>/dev/null || true)
+            say "  ${result:-could not run fast-share-mount forget --all}"
         else
             forget_kwallet_folder
             if command -v secret-tool >/dev/null; then
                 secret-tool clear application "$APP_ID" 2>/dev/null || true
             fi
+            say "  asked KWallet and the keyring to remove saved passwords"
         fi
-        say "  removed saved passwords"
     fi
 
     remove_listed "$own_dir/installed-files.txt" "$bin_dir" "$data/kio/servicemenus" "$own_dir"
@@ -266,9 +272,9 @@ main() {
                 uninstall_system
             elif command -v sudo >/dev/null; then
                 say "Root rights are needed to unmount and remove the system part."
-                sudo -- /bin/bash "$SCRIPT" "${pass[@]}" || die "The system part was not removed; nothing else was changed"
+                sudo -- /bin/bash "$SCRIPT" "${pass[@]}" || die "The system part was not removed and your files were left in place (idle shares may already be unmounted)"
             elif command -v pkexec >/dev/null; then
-                pkexec /bin/bash "$SCRIPT" "${pass[@]}" || die "The system part was not removed; nothing else was changed"
+                pkexec /bin/bash "$SCRIPT" "${pass[@]}" || die "The system part was not removed and your files were left in place (idle shares may already be unmounted)"
             else
                 die "Neither sudo nor pkexec is available for the system part"
             fi

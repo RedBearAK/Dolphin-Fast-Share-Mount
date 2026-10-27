@@ -86,8 +86,9 @@ mountpoint="$BASE/127.0.0.1/Shared"
 check "user owns the files" "$UID_SELF" "$(stat -c %u "$mountpoint")"
 echo "written by the test" > "$mountpoint/test-file.txt"
 check "write and read back" "written by the test" "$(cat "$mountpoint/test-file.txt")"
-check "user folder is 0700 root" "700 0" "$(sudo stat -c '%a %u' "$BASE")"
-check "user ACL" "user:$UID_SELF:r-x" "$(sudo getfacl -p "$BASE" 2>/dev/null | grep "^user:$UID_SELF:")"
+check "user folder owned by root, group bits show the ACL mask" "750 0" "$(sudo stat -c '%a %u' "$BASE")"
+check "user ACL" "user::rwx user:$UID_SELF:r-x group::--- mask::r-x other::---" \
+    "$(sudo getfacl -pn "$BASE" 2>/dev/null | grep -v '^#' | grep . | tr '\n' ' ' | sed 's/ $//')"
 check "other users cannot list" "denied" "$(sudo -u nobody ls "$BASE" >/dev/null 2>&1 && echo allowed || echo denied)"
 vers=$(sed -n "s|.* $mountpoint .* - cifs .*vers=\([0-9.]*\).*|\1|p" /proc/self/mountinfo)
 check "SMB 2.1 or later negotiated" "yes" "$([[ $vers =~ ^(2\.1|3) ]] && echo yes || echo "no ($vers)")"
@@ -114,7 +115,7 @@ check "mount for stale test" "0|OK|" "$(helper "$TEST_PASSWORD" mount "${common[
 check "stale server: forced unmount" "0|UNMOUNTED|" "$(helper "" unmount --uid "$UID_SELF" --path "$mountpoint" --lazy)"
 check "server gone: reported" "12||EHOST" "$(helper "$TEST_PASSWORD" mount "${common[@]}" --share Shared --user "$TEST_USER")"
 
-check "unmount-all leaves an empty tree" "" "$(sudo "$HELPER" unmount-all --uid "$UID_SELF" >/dev/null 2>&1; sudo find "$BASE" -mindepth 1 2>/dev/null)"
+check "unmount-all leaves an empty tree" "" "$(sudo "$HELPER" unmount-all --uid "$UID_SELF" --lazy >/dev/null 2>&1; sudo find "$BASE" -mindepth 1 2>/dev/null)"
 
 echo "passed $PASSED, failed $FAILED"
 (( FAILED == 0 ))

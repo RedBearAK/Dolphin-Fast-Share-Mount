@@ -38,16 +38,17 @@ warn() { printf 'Warning: %s\n' "$*" >&2; }
 die() { printf 'Error: %s\n' "$*" >&2; exit 1; }
 
 usage() {
-    sed -n '3,22p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '3,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 # ---- file helpers ---------------------------------------------------------------
 
-# A path is safe to put into sed replacement text and a .desktop Exec line.
+# A path is safe to put into sed replacement text and a .desktop Exec line
+# (where "%" would start a field code).
 check_plain_path() {
     local path=$1
     [[ $path == /* ]] || die "Not an absolute path: $path"
-    [[ $path != *[\"\\\`\$\&\|\;$'\n'$'\t']* ]] \
+    [[ $path != *[\"\\\`\$\&\|\;%$'\n'$'\t']* ]] \
         || die "The path contains characters this installer does not handle: $path"
 }
 
@@ -150,12 +151,14 @@ install_system() {
         done
         # The user side only starts a helper that no one but root can change,
         # in folders no one but root can change.
-        dir=${helper%/*}
-        while [[ -n $dir ]]; do
+        dir=$(readlink -f -- "${helper%/*}")
+        while :; do
             if [[ $(stat -c %u -- "$dir") != 0 ]] || (( 0$(stat -c %a -- "$dir") & 022 )); then
                 warn "$dir can be changed by a user other than root; the helper will refuse to run from there"
             fi
+            [[ $dir != / ]] || break
             dir=${dir%/*}
+            dir=${dir:-/}
         done
         if command -v pkaction >/dev/null; then
             if pkaction --action-id "$POLKIT_ACTION" >/dev/null 2>&1; then

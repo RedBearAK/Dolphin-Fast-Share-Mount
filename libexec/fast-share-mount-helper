@@ -7,8 +7,9 @@
 #
 # It is started by the user-side command fast-share-mount through pkexec
 # (polkit action io.github.redbearak.dolphin-fast-share-mount.mount) or sudo.
-# Every argument is validated here. Mount points are computed here and never
-# taken from the caller. The password, when there is one, arrives on stdin
+# Every argument is validated here. Mount points are computed here; unmount
+# accepts only a path of exactly the shape <base>/<uid>/<host>/<share> that
+# holds a CIFS mount. The password, when there is one, arrives on stdin
 # and reaches mount.cifs through a pipe (PASSWD_FD): never argv, never the
 # environment, never a file.
 #
@@ -100,7 +101,9 @@ is_valid_host() {
 is_valid_share() {
     local share=$1
     (( ${#share} >= 1 && ${#share} <= 255 )) || return 1
-    [[ $share != *[/\\]* ]] || return 1
+    # mount.cifs hands the source to the kernel inside its comma-separated
+    # option string, so a comma or "=" would add mount options.
+    [[ $share != *[/\\,=]* ]] || return 1
     [[ $share != *[[:cntrl:]]* ]] || return 1
     [[ $share != -* && $share != . && $share != .. ]] || return 1
 }
@@ -205,8 +208,11 @@ smb_version_from_options() {
     printf 'unknown'
 }
 
+# Case-insensitive comparison, also for non-ASCII letters (C.UTF-8 exists in
+# glibc 2.35 and later; elsewhere the comparison falls back to ASCII).
 same_source() {
     local a=$1 b=$2
+    local LC_ALL=C.UTF-8 2>/dev/null
     [[ ${a,,} == "${b,,}" ]]
 }
 
@@ -291,8 +297,11 @@ check_target_uid() {
     [[ $TARGET_GID =~ ^[0-9]+$ ]] || fail EINTERNAL "Could not read the user's group" "$entry"
 }
 
+# ensure_root_dir PATH MODE [keep]: a root-owned folder that is not a
+# symbolic link. MODE is applied on creation, and also afterwards unless
+# "keep" is given (for a folder whose permissions an ACL sets).
 ensure_root_dir() {
-    local path=$1 mode=$2 owner
+    local path=$1 mode=$2 keep=${3:-} owner
     if [[ -L $path ]]; then
         fail EINTERNAL "Unexpected symbolic link in the mount tree" "$path"
     fi
@@ -303,16 +312,19 @@ ensure_root_dir() {
     owner=$(stat -c %u -- "$path")
     [[ $owner == 0 ]] || fail EINTERNAL "Folder in the mount tree not owned by root" "$path"
     chown root:root -- "$path"
-    chmod "$mode" -- "$path"
+    [[ -n $keep ]] || chmod "$mode" -- "$path"
 }
 
-# /run/dolphin-fast-share-mount/<uid>: root-owned 0700, readable and
-# traversable only by the user through an ACL.
+# /run/dolphin-fast-share-mount/<uid>: owned by root, and through an access
+# list readable and traversable by that user only (owner rwx, the user r-x,
+# group and others nothing; ls shows drwxr-x--- because the group bits show
+# the ACL mask). setfacl --set replaces the whole list in one step, so the
+# user's access never drops out while it is applied.
 ensure_user_root() {
     local uid=$1 err
-    ensure_root_dir "$MOUNT_BASE" 0755
-    ensure_root_dir "$MOUNT_BASE/$uid" 0700
     command -v setfacl >/dev/null || fail EMISSING "setfacl is missing (package acl)"
+    ensure_root_dir "$MOUNT_BASE" 0755
+    ensure_root_dir "$MOUNT_BASE/$uid" 0700 keep
     if ! err=$(setfacl --set "u::rwx,g::---,o::---,u:$uid:r-x,m::r-x" -- "$MOUNT_BASE/$uid" 2>&1); then
         fail EINTERNAL "Could not set the access list on the user's mount folder" "$err"
     fi
@@ -329,19 +341,34 @@ read_password() {
     local password=""
     IFS= read -r -n "$((PASSWORD_MAX + 1))" password || true
     if (( ${#password} > PASSWORD_MAX )); then
-        fail EINVALID "The password is longer than $PASSWORD_MAX characters"
+        fail EINVALID "The password is longer than $PASSWORD_MAX bytes"
     fi
     PASSWORD=$password
 }
 
+# The last kernel CIFS lines since the attempt started, for the error
+# detail. Lines that name another server (\\server) are left out, so one
+# user's error report does not show other users' servers.
 kernel_cifs_lines() {
-    local since=$1
-    if command -v journalctl >/dev/null; then
-        timeout 5 journalctl -k -q --no-pager -o cat --since "@$since" 2>/dev/null \
-            | grep -i 'cifs' | tail -n 4 || true
-    else
-        timeout 5 dmesg 2>/dev/null | grep -i 'cifs' | tail -n 4 || true
-    fi
+    local since=$1 host=$2 line
+    {
+        if command -v journalctl >/dev/null; then
+            timeout 5 journalctl -k -q --no-pager -o cat --since "@$since" 2>/dev/null || true
+        else
+            timeout 5 dmesg 2>/dev/null || true
+        fi
+    } | while IFS= read -r line; do
+        [[ ${line,,} == *cifs* ]] || continue
+        if [[ $line == *"\\\\"* && ${line,,} != *"\\\\${host,,}"* ]]; then
+            continue
+        fi
+        printf '%s\n' "$line"
+    done | tail -n 4
+}
+
+# The mount answers a stat within PROBE_TIMEOUT seconds.
+probe_readable() {
+    timeout "$PROBE_TIMEOUT" stat -- "$1/." >/dev/null 2>&1
 }
 
 # ---- commands ------------------------------------------------------------------
@@ -447,7 +474,11 @@ cmd_mount() {
     PASSWORD=""
 
     if (( status != 0 )); then
-        kernel=$(kernel_cifs_lines "$started")
+        kernel=$(kernel_cifs_lines "$started" "$host")
+        # A mount that completed after timeout stopped mount.cifs is detached.
+        if mount_entry_at "$MOUNTINFO" "$mountpoint"; then
+            timeout "$UMOUNT_TIMEOUT" umount -l -- "$mountpoint" 2>/dev/null || true
+        fi
         remove_if_empty "$mountpoint" "$host_dir"
         classify_mount_error "$status" "$err" "$kernel"
         fail "$CLASS_CODE" "$CLASS_MESSAGE" "mount.cifs exit $status: $err${kernel:+ | kernel: $kernel}"
@@ -457,7 +488,7 @@ cmd_mount() {
         remove_if_empty "$mountpoint" "$host_dir"
         fail EINTERNAL "mount.cifs reported success but no CIFS mount is present" "$mountpoint"
     fi
-    if ! timeout "$PROBE_TIMEOUT" stat -- "$mountpoint/." >/dev/null 2>&1; then
+    if ! probe_readable "$mountpoint"; then
         timeout "$UMOUNT_TIMEOUT" umount -l -- "$mountpoint" 2>/dev/null || true
         remove_if_empty "$mountpoint" "$host_dir"
         fail EHOST "The share was mounted but cannot be read" "$mountpoint"
@@ -569,9 +600,20 @@ cmd_unmount_all() {
         fi
     done < <(cifs_mounts_under "$MOUNTINFO" "$root")
 
-    if [[ -d $root && ! -L $root ]]; then
-        find "$root" -xdev -mindepth 1 -depth -type d -empty -delete 2>/dev/null || true
+    # Remove empty folders, deepest first, with rmdir only: it refuses a
+    # folder that holds a mount or is one without reading from the server.
+    # The patterns have no trailing slash, so globbing lists the tmpfs folders
+    # without stat-ing the mount points in them.
+    local folder
+    local -a folders=()
+    if [[ -n $every ]]; then
+        folders=("$root"/*/*/* "$root"/*/* "$root"/*)
+    else
+        folders=("$root"/*/* "$root"/*)
     fi
+    for folder in "${folders[@]}"; do
+        rmdir -- "$folder" 2>/dev/null || true
+    done
     if (( failed > 0 )); then
         fail "$first_code" "$failed mount(s) could not be unmounted" "$details"
     fi

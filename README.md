@@ -30,7 +30,7 @@ The mount appears at:
 /run/dolphin-fast-share-mount/<your uid>/<server>/<share>
 ```
 
-One folder per server keeps shares with generic names (`Shared`, `Media`, `Backups`) on different servers apart. Characters other than letters, digits, `.`, `_` and `-` become `_` in the folder name, so the share `My Share` on `nas` is at `.../nas/My_Share`.
+One folder per server keeps shares with generic names (`Shared`, `Media`, `Backups`) on different servers apart. In the folder name, every byte other than an ASCII letter, a digit, `.`, `_` or `-` becomes `_` (so `My Share` becomes `My_Share`, and `Ö`, two bytes in UTF-8, becomes `__`), a leading `.` becomes `_`, and names are cut at 100 bytes. If two shares end up with the same folder name, the second gets `~2`, the next `~3`, and so on.
 
 ## Requirements
 
@@ -92,7 +92,7 @@ fast-share-mount unmount [--force] PATH|URL|SERVER/SHARE...
 fast-share-mount unmount --all
 fast-share-mount list
 fast-share-mount check
-fast-share-mount forget USER@SERVER
+fast-share-mount forget [DOMAIN;]USER@SERVER
 fast-share-mount forget --all
 fast-share-mount --version
 ```
@@ -101,7 +101,7 @@ Examples:
 
 ```
 fast-share-mount mount smb://nas.local/Media/Films
-fast-share-mount mount smb://CORP;kkf@fileserver/Projects
+fast-share-mount mount smb://CORP;jordan@fileserver/Projects
 fast-share-mount mount smb://guest@printer-box/Scans
 fast-share-mount unmount nas.local/Media
 ```
@@ -130,10 +130,11 @@ Mounting needs root, so the tool has two halves.
 
 `fast-share-mount-helper` is a short bash script, the only code that runs as root. It:
 
-- validates every argument (server name, share name, user name, domain, port, SMB version) and computes the mount point itself; nothing the caller passes becomes a path;
+- validates every argument (server name, share name, user name, domain, port, SMB version), refusing anything that could add a mount option, such as a comma in a share name;
+- computes every mount point itself; for unmounting it accepts only a path of exactly the shape `/run/dolphin-fast-share-mount/<uid>/<server>/<share>` that holds a CIFS mount;
 - under pkexec, only mounts for the user who asked;
 - receives the password on stdin and hands it to `mount.cifs` through a pipe, so it never appears in a process list, an environment or a file;
-- keeps the whole tree under `/run/dolphin-fast-share-mount` owned by root, so no user can swap a folder for a symbolic link and redirect a mount; your own folder in it is `0700` with an access list that lets only you in, so other users on the computer cannot see which servers and shares you have mounted, let alone the files;
+- keeps the whole tree under `/run/dolphin-fast-share-mount` owned by root, so no user can swap a folder for a symbolic link and redirect a mount; your own folder in it carries an access list that lets only you in (it shows as `drwxr-x---`, root's group and everyone else having no access), so other users on the computer cannot see which servers and shares you have mounted, let alone the files;
 - mounts with `uid`/`gid` set to you, `noperm` (the server enforces permissions), `nosuid` and `nodev`;
 - checks the mount is really there and readable before reporting success.
 
@@ -162,6 +163,7 @@ Set `FAST_SHARE_MOUNT_DEBUG=1` to log the commands run (passwords are never logg
 
 ## Limitations
 
+- Image-based systems such as Fedora Atomic (Kinoite) are not supported yet: `/usr/share` is read-only there and `/usr/local` is a symbolic link into `/var`.
 - Shares stay mounted until you unmount them or reboot; there is no idle timeout.
 - IPv6 address literals in the address (`smb://[fe80::1]/share`) are not supported yet; use the server's name.
 - The unmount entry appears on every local folder, because Dolphin menus cannot check whether a folder is a mount.

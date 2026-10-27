@@ -1,8 +1,9 @@
 22 1 0:21 / / rw,relatime shared:1 - btrfs /dev/sda2 rw,space_cache=v2,subvolid=256
 30 22 0:25 / /run rw,nosuid,nodev shared:5 - tmpfs tmpfs rw,size=6568576k,mode=755,inode64
-100 30 0:50 / /run/dolphin-fast-share-mount/1000/photos.rbns.cloud/Shared rw,nosuid,nodev,relatime shared:60 - cifs //photos.rbns.cloud/Shared rw,vers=3.1.1,cache=strict,username=kkf,uid=1000,forceuid,gid=1000,forcegid,addr=192.168.1.5,noperm
+100 30 0:50 / /run/dolphin-fast-share-mount/1000/photos.example.net/Shared rw,nosuid,nodev,relatime shared:60 - cifs //photos.example.net/Shared rw,vers=3.1.1,cache=strict,username=jordan,uid=1000,forceuid,gid=1000,forcegid,addr=192.168.1.5,noperm
 101 30 0:51 / /run/dolphin-fast-share-mount/1000/nas/My_Share rw,nosuid,nodev,relatime - cifs //nas/My\040Share rw,vers=3.0,username=kris,uid=1000,forceuid,gid=1000,forcegid
 102 22 0:52 / /mnt/media rw,relatime shared:70 master:3 - cifs //NAS/Media rw,vers=3.1.1,username=kris
 103 30 0:53 / /run/dolphin-fast-share-mount/1001/nas/Media rw,nosuid,nodev - cifs //nas/Media rw,vers=3.1.1,username=other
 104 22 0:54 / /mnt/with\040space rw,relatime - nfs4 server:/export rw,vers=4.2
 105 22 0:55 / /mnt/nested rw,relatime - smb3 //backup/Archive rw,vers=3.1.1,username=kris
+106 30 0:56 / /run/dolphin-fast-share-mount/1001/nas/Private rw,nosuid,nodev - cifs //nas/Private rw,vers=3.1.1,username=other

@@ -36,13 +36,14 @@ def valid(function: str, value: str) -> bool:
     return bash(f'{function} "$1"', value).returncode == 0
 
 
-HOSTS = ["nas", "photos.rbns.cloud", "192.168.1.5", "a-b.example", "NAS", "x" * 63,
+HOSTS = ["nas", "photos.example.net", "192.168.1.5", "a-b.example", "NAS", "x" * 63,
          ".nas", "nas.", "a..b", "-nas", "nas-", "na_s", "na s", "", "x" * 64,
          ".".join(["a" * 63] * 4), "host;rm", "host/x", "fe80::1", "a.-b"]
 SHARES = ["Shared", "My Share", "C$", "Fotos Österreich", "x" * 255, "x" * 256, "",
           "a/b", "a\\b", "-x", ".", "..", "...", "tab\there", "new\nline", "del\x7f",
-          "comma,share", "dot.share", "Ünïcödé" * 40]
-USERS = ["kris", "kkf", "first.last", "user@example.com", "machine$", "John Smith",
+          "comma,share", "x,sec=krb5,cruid=0", "a=b", "dot.share", "Ünïcödé" * 40,
+          "Ö" * 127, "Ö" * 128, "Ö" * 200]
+USERS = ["kris", "jordan", "first.last", "user@example.com", "machine$", "John Smith",
          " lead", "trail ", "", "a,b", "a=b", "a%b", "dom\\user", "a/b", "x" * 64, "x" * 65,
          "-dash", "Ünï"]
 DOMAINS = ["WORKGROUP", "corp.example", "", "-x", "a" * 64, "a" * 65, "a b", "a;b"]
@@ -69,10 +70,13 @@ class ValidationTests(unittest.TestCase):
         self.check_agreement("is_valid_domain", user_side.is_valid_domain, DOMAINS)
 
     def test_expected_verdicts(self):
-        self.assertTrue(valid("is_valid_host", "photos.rbns.cloud"))
+        self.assertTrue(valid("is_valid_host", "photos.example.net"))
         self.assertFalse(valid("is_valid_host", "fe80::1"))
         self.assertTrue(valid("is_valid_share", "My Share"))
         self.assertFalse(valid("is_valid_share", ".."))
+        self.assertFalse(valid("is_valid_share", "x,sec=krb5,cruid=0"))
+        self.assertTrue(valid("is_valid_share", "Ö" * 127))
+        self.assertFalse(valid("is_valid_share", "Ö" * 128), "the limit is 255 bytes")
         self.assertTrue(valid("is_valid_user", "John Smith"))
         self.assertFalse(valid("is_valid_user", "a,b"))
         self.assertFalse(valid("is_valid_user", "a%b"))
@@ -101,7 +105,7 @@ class NameTests(unittest.TestCase):
         self.assertEqual(self.name("My Share"), "My_Share")
         self.assertEqual(self.name("C$"), "C_")
         self.assertEqual(self.name(".hidden"), "_hidden")
-        self.assertEqual(self.name("photos.rbns.cloud"), "photos.rbns.cloud")
+        self.assertEqual(self.name("photos.example.net"), "photos.example.net")
         self.assertEqual(self.name("Ö"), "__")
         self.assertEqual(len(self.name("x" * 200)), 100)
 
@@ -131,10 +135,10 @@ class MountTableTests(unittest.TestCase):
                     '"$ENTRY_FSTYPE" "$ENTRY_OPTIONS"', self.fixture, mountpoint)
 
     def test_entry_found(self):
-        result = self.entry("/run/dolphin-fast-share-mount/1000/photos.rbns.cloud/Shared")
+        result = self.entry("/run/dolphin-fast-share-mount/1000/photos.example.net/Shared")
         self.assertEqual(result.returncode, 0)
         source, fstype, options = result.stdout.split("|")
-        self.assertEqual((source, fstype), ("//photos.rbns.cloud/Shared", "cifs"))
+        self.assertEqual((source, fstype), ("//photos.example.net/Shared", "cifs"))
         self.assertIn("vers=3.1.1", options)
 
     def test_entry_with_escaped_space_and_no_optional_fields(self):
@@ -150,11 +154,11 @@ class MountTableTests(unittest.TestCase):
     def test_cifs_mounts_under(self):
         result = bash('cifs_mounts_under "$1" "$2"', self.fixture, "/run/dolphin-fast-share-mount/1000")
         self.assertEqual(result.stdout.splitlines(), [
-            "/run/dolphin-fast-share-mount/1000/photos.rbns.cloud/Shared",
+            "/run/dolphin-fast-share-mount/1000/photos.example.net/Shared",
             "/run/dolphin-fast-share-mount/1000/nas/My_Share",
         ])
         every = bash('cifs_mounts_under "$1" "$2"', self.fixture, "/run/dolphin-fast-share-mount")
-        self.assertEqual(len(every.stdout.splitlines()), 3)
+        self.assertEqual(len(every.stdout.splitlines()), 4)
 
     def test_version_from_options(self):
         self.assertEqual(bash('smb_version_from_options "$1"', "rw,vers=3.0,uid=1").stdout, "3.0")
@@ -239,6 +243,7 @@ STUB_MOUNT_CIFS = textwrap.dedent("""\
         auth) echo "mount error(13): Permission denied" >&2; exit 32 ;;
         noshare) echo "mount error(2): No such file or directory" >&2; exit 32 ;;
         down) echo "mount error(112): Host is down" >&2; exit 32 ;;
+        silent) ;;
     esac
     """)
 
@@ -263,7 +268,7 @@ class MountFlowTests(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def mount(self, *args, stdin="secret\n", mode="ok", kernel=""):
+    def mount(self, *args, stdin="secret\n", mode="ok", kernel="", extra=""):
         script = (
             'MOUNT_BASE="$BASE"; MOUNTINFO="$STUB_MOUNTINFO"; PATH="$STUB_DIR:$PATH"; '
             'require_root() { :; }; '
@@ -271,6 +276,7 @@ class MountFlowTests(unittest.TestCase):
             'ensure_root_dir() { mkdir -p -- "$1"; }; '
             'ensure_user_root() { mkdir -p -- "$MOUNT_BASE/$1"; }; '
             'kernel_cifs_lines() { printf "%s" "$KERNEL"; }; '
+            + extra +
             'cmd_mount "$@"'
         )
         env = {"BASE": self.base, "STUB_DIR": self.stub_dir, "STUB_MOUNTINFO": self.mountinfo,
@@ -350,8 +356,27 @@ class MountFlowTests(unittest.TestCase):
         self.assertEqual(second.returncode, 0, second.stderr)
         self.assertTrue(second.stdout.split("\t")[1].endswith("/nas/My_Share~2"))
 
+    def test_non_ascii_share_in_other_case_is_already_mounted(self):
+        first = self.mount("--uid", "1000", "--host", "nas", "--share", "Österreich", "--user", "kris")
+        second = self.mount("--uid", "1000", "--host", "nas", "--share", "österreich", "--user", "kris")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertTrue(second.stdout.startswith("ALREADY\t"), second.stdout + second.stderr)
+
+    def test_unreadable_mount_is_detached_and_reported(self):
+        result = self.mount("--uid", "1000", "--host", "nas", "--share", "x", "--user", "kris",
+                            extra="probe_readable() { return 1; }; umount() { :; }; ")
+        self.assertEqual(result.returncode, 12)
+        self.assertIn("cannot be read", result.stderr)
+
+    def test_missing_mount_after_success_is_reported(self):
+        result = self.mount("--uid", "1000", "--host", "nas", "--share", "x", "--user", "kris",
+                            mode="silent")
+        self.assertEqual(result.returncode, 20)
+        self.assertIn("no CIFS mount is present", result.stderr)
+
     def test_invalid_input_rejected_before_mounting(self):
         for args in (("--host", "na s", "--share", "x"), ("--host", "nas", "--share", ".."),
+                     ("--host", "nas", "--share", "x,sec=krb5,cruid=0"),
                      ("--host", "nas", "--share", "x", "--port", "99999"),
                      ("--host", "nas", "--share", "x", "--vers", "3.1.1,uid=0")):
             with self.subTest(args=args):
@@ -377,6 +402,103 @@ class DirectoryTests(unittest.TestCase):
 
     def test_helper_file_is_executable(self):
         self.assertTrue(os.stat(HELPER).st_mode & stat.S_IXUSR)
+
+
+class CallerTests(unittest.TestCase):
+    """Rules that only the integration test exercised before."""
+
+    def test_pkexec_caller_must_be_the_target_user(self):
+        uid = str(os.getuid())
+        other = str(os.getuid() + 1)
+        refused = bash('check_target_uid "$1"', uid, env={"PKEXEC_UID": other})
+        self.assertEqual(refused.returncode, 17)
+        self.assertIn("own mounts", refused.stderr)
+        allowed = bash('check_target_uid "$1" && printf "%s" "$TARGET_GID"', uid,
+                       env={"PKEXEC_UID": uid})
+        self.assertEqual(allowed.returncode, 0, allowed.stderr)
+        self.assertEqual(allowed.stdout, str(os.getgid()))
+
+    def test_every_user_refused_under_pkexec(self):
+        result = bash('require_root() { :; }; cmd_unmount_all --every-user',
+                      env={"PKEXEC_UID": str(os.getuid())})
+        self.assertEqual(result.returncode, 17)
+
+    def test_missing_setfacl_leaves_the_folder_alone(self):
+        result = bash('PATH=/nonexistent; hash -r; '
+                      'ensure_root_dir() { echo "touched $1" >&2; }; ensure_user_root 1000')
+        self.assertEqual(result.returncode, 16)
+        self.assertNotIn("touched", result.stderr)
+
+    def test_access_list_is_set_in_one_step_without_chmod(self):
+        result = bash('ensure_root_dir() { echo "dir $*"; }; '
+                      'exec 9>&1; setfacl() { echo "setfacl $*" >&9; }; ensure_user_root 1000')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines(), [
+            "dir /run/dolphin-fast-share-mount 0755",
+            "dir /run/dolphin-fast-share-mount/1000 0700 keep",
+            "setfacl --set u::rwx,g::---,o::---,u:1000:r-x,m::r-x -- "
+            "/run/dolphin-fast-share-mount/1000",
+        ])
+
+    def test_keep_skips_chmod(self):
+        if os.geteuid() == 0:
+            self.skipTest("runs as root")
+        result = bash('stat() { echo 0; }; chown() { :; }; chmod() { echo "chmod $*"; }; '
+                      'ensure_root_dir "$1" 0700 keep; ensure_root_dir "$1" 0755', tempfile.gettempdir())
+        self.assertEqual(result.stdout.splitlines(), [f"chmod 0755 -- {tempfile.gettempdir()}"])
+
+
+class UnmountTests(unittest.TestCase):
+    def test_busy_and_timeout(self):
+        busy = bash('umount() { echo "umount: $2: target is busy." >&2; return 32; }; '
+                    'timeout() { shift; "$@"; }; '
+                    'unmount_one /x "" || printf "%s" "$UNMOUNT_CODE"')
+        self.assertEqual(busy.stdout, "EBUSY")
+        slow = bash('timeout() { return 124; }; unmount_one /x "" || printf "%s" "$UNMOUNT_CODE"')
+        self.assertEqual(slow.stdout, "ETIMEOUT")
+
+    def test_lazy_passes_l(self):
+        result = bash('exec 9>&1; timeout() { shift; "$@"; }; umount() { echo "umount $*" >&9; }; '
+                      'remove_if_empty() { :; }; unmount_one /x 1')
+        self.assertIn("umount -l -- /x", result.stdout)
+
+    def test_not_mounted(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = f"{folder}/1000/nas/x"
+            os.makedirs(path)
+            result = bash('MOUNT_BASE="$1"; MOUNTINFO="$2"; require_root() { :; }; '
+                          'check_target_uid() { :; }; cmd_unmount --uid 1000 --path "$3"',
+                          folder, os.path.join(FIXTURES, "mountinfo.txt"), path)
+            self.assertEqual(result.returncode, 15)
+            self.assertFalse(os.path.exists(path), "empty leftover folder not removed")
+
+    def test_unmount_all_removes_only_empty_folders(self):
+        with tempfile.TemporaryDirectory() as folder:
+            os.makedirs(f"{folder}/1000/nas/Empty")
+            os.makedirs(f"{folder}/1000/nas/Kept")
+            with open(f"{folder}/1000/nas/Kept/file", "w", encoding="utf-8") as handle:
+                handle.write("x")
+            os.makedirs(f"{folder}/1000/other/Gone")
+            result = bash('MOUNT_BASE="$1"; MOUNTINFO=/dev/null; require_root() { :; }; '
+                          'check_target_uid() { :; }; cmd_unmount_all --uid 1000', folder)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(os.path.exists(f"{folder}/1000/nas/Empty"))
+            self.assertFalse(os.path.exists(f"{folder}/1000/other"))
+            self.assertTrue(os.path.exists(f"{folder}/1000/nas/Kept/file"))
+
+
+class KernelLineTests(unittest.TestCase):
+    def test_other_servers_are_left_out(self):
+        lines = ("CIFS: VFS: \\\\otherbox Send error in SessSetup = -13\n"
+                 "CIFS: VFS: \\\\NAS Dialect not supported\n"
+                 "CIFS: VFS: cifs_mount failed w/return code = -112\n"
+                 "usb 1-1: new device\n")
+        result = bash('timeout() { shift; "$@"; }; journalctl() { printf "%s" "$LINES"; }; '
+                      'kernel_cifs_lines 0 nas', env={"LINES": lines})
+        self.assertEqual(result.stdout.splitlines(), [
+            "CIFS: VFS: \\\\NAS Dialect not supported",
+            "CIFS: VFS: cifs_mount failed w/return code = -112",
+        ])
 
 
 if __name__ == "__main__":

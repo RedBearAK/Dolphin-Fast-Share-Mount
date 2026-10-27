@@ -10,7 +10,8 @@ never runs as root and never passes a password on a command line.
 
 Standard library only. The shebang runs the system Python in isolated mode
 (-I), so PYTHONPATH, the user's site-packages and active virtual
-environments cannot change what runs.
+environments cannot change what runs, and external programs (pkexec, sudo,
+kdialog...) are looked up in the system folders only, never in PATH.
 
 SPDX-License-Identifier: GPL-3.0-or-later
 """
@@ -90,7 +91,8 @@ def is_valid_share(share: str) -> bool:
     size = len(share.encode("utf-8", "surrogateescape"))
     if not 1 <= size <= 255:
         return False
-    if "/" in share or "\\" in share:
+    # A comma or "=" would add kernel mount options (see the helper).
+    if any(ch in share for ch in "/\\,="):
         return False
     if any(ord(ch) < 32 or ord(ch) == 127 for ch in share):
         return False
@@ -155,7 +157,7 @@ def parse_smb_url(url: str) -> ShareRef:
         raise UsageError("The address names no server.")
     port = None
     if port_text:
-        if not port_text.isdigit() or not 1 <= int(port_text) <= 65535:
+        if not re.fullmatch(r"[0-9]{1,5}", port_text) or not 1 <= int(port_text) <= 65535:
             raise UsageError(f"Invalid port in the address: {port_text}")
         port = int(port_text)
     segments = [urllib.parse.unquote(s) for s in parts.path.split("/") if s]
@@ -168,8 +170,8 @@ def parse_smb_url(url: str) -> ShareRef:
         raise UsageError(f"Server name not supported: {host}")
     if not is_valid_share(share):
         raise UsageError(f"Share name not supported: {share}")
-    if any(s in (".", "..") or "\0" in s for s in subpath):
-        raise UsageError("The address contains '.' or '..' folders.")
+    if any(s in (".", "..") or "/" in s or "\0" in s for s in subpath):
+        raise UsageError("The address contains '.' or '..' folders or an encoded '/'.")
     if user is not None and not is_valid_user(user):
         raise UsageError(f"User name not supported: {user}")
     if domain is not None and not is_valid_domain(domain):
@@ -329,7 +331,11 @@ def parse_mountinfo(text: str) -> list:
 
 
 def read_mounts() -> list:
-    with open("/proc/self/mountinfo", encoding="utf-8", errors="surrogateescape") as handle:
+    # FAST_SHARE_MOUNT_MOUNTINFO lets the tests use a mount table of their own.
+    # It only changes what this unprivileged program sees; the helper always
+    # reads the real table.
+    path = os.environ.get("FAST_SHARE_MOUNT_MOUNTINFO") or "/proc/self/mountinfo"
+    with open(path, encoding="utf-8", errors="surrogateescape") as handle:
         return parse_mountinfo(handle.read())
 
 
@@ -364,38 +370,40 @@ def mount_containing(path: str, entries: list) -> MountEntry | None:
     return best
 
 
-def find_existing(ref: ShareRef, entries: list, uid: int) -> tuple:
-    """(own mount, foreign mount) of this share; either may be None.
-    Mounts of other users of this tool are ignored."""
+def _sort_existing(entries: list, uid: int) -> tuple:
     own = foreign = None
-    for entry in cifs_mounts(entries):
-        if source_key(entry.source) != ref.key:
-            continue
+    others = []
+    for entry in entries:
         if is_own_mount(entry, uid):
             own = own or entry
         elif not entry.target.startswith(MOUNT_BASE + "/"):
-            foreign = foreign or entry
-    return own, foreign
+            others.append(entry)
+    return own, others
 
 
-def find_foreign_by_address(ref: ShareRef, entries: list) -> MountEntry | None:
-    """Second step of the duplicate check: a foreign mount of the same share
-    through another name or an IP address of the same server."""
+def find_existing(ref: ShareRef, entries: list, uid: int) -> tuple:
+    """(own mount or None, list of foreign mounts) of this share, matched by
+    server name and share name. Mounts of other users of this tool are
+    ignored."""
+    same = [e for e in cifs_mounts(entries) if source_key(e.source) == ref.key]
+    return _sort_existing(same, uid)
+
+
+def find_by_address(ref: ShareRef, entries: list, uid: int) -> tuple:
+    """Second step of the duplicate check, like find_existing but for mounts
+    of the same share through another name or IP address of the server."""
     candidates = []
     for entry in cifs_mounts(entries):
         key = source_key(entry.source)
-        if key and key[1] == ref.key[1] and key[0] != ref.key[0] \
-                and not entry.target.startswith(MOUNT_BASE + "/"):
+        if key and key[1] == ref.key[1] and key[0] != ref.key[0]:
             candidates.append((key[0], entry))
     if not candidates:
-        return None
+        return None, []
     ours = resolve(ref.host)
     if not ours:
-        return None
-    for host, entry in candidates:
-        if resolve(host) & ours:
-            return entry
-    return None
+        return None, []
+    same = [entry for host, entry in candidates if resolve(host) & ours]
+    return _sort_existing(same, uid)
 
 
 def resolve(host: str) -> set:
@@ -438,7 +446,9 @@ def path_responds(path: str, timeout: int = PROBE_TIMEOUT) -> bool:
 
 
 def which(name: str) -> str | None:
-    return shutil.which(name, path=os.environ.get("PATH", "") + ":" + SEARCH_PATH)
+    """Programs come from the system folders only: a program of the same name
+    placed earlier in PATH must not receive a password."""
+    return shutil.which(name, path=SEARCH_PATH)
 
 
 def run(argv: list, input_text: str | None = None, timeout: int = 30,
@@ -481,13 +491,12 @@ class UI:
         print(f"{title}: {body}", file=sys.stderr)
         if not self.gui:
             return
+        self.notify(title, body, urgent=True)
         if which("kdialog"):
             run(["kdialog", "--title", APP_NAME, "--error", f"{title}\n\n{details}"], timeout=3600)
         elif which("zenity"):
             run(["zenity", "--error", "--title", APP_NAME, "--text", f"{title}\n\n{details}"],
                 timeout=3600)
-        else:
-            self.notify(title, body, urgent=True)
 
     def ask_yes_no(self, question: str) -> bool:
         if not self.gui:
@@ -654,7 +663,9 @@ def is_root_secure(path: str) -> str | None:
         return f"{path} is not a regular file"
     if info.st_uid != 0 or info.st_mode & 0o022:
         return f"{path} can be changed by a user other than root"
-    folder = os.path.dirname(path)
+    # Symbolic links among the folders (/bin -> usr/bin) are followed: every
+    # folder of the resolved path is checked.
+    folder = os.path.dirname(os.path.realpath(path))
     while True:
         try:
             info = os.lstat(folder)
@@ -819,7 +830,8 @@ def explain(result: HelperResult, ref: ShareRef, user: str) -> tuple:
                 f"speaks SMB1, set smb_version=1.0 in {config_path()} (SMB1 is insecure).")
     if code == "EMISSING":
         tool = "mount.cifs" if "mount.cifs" in result.message else \
-            "setfacl" if "setfacl" in result.message else ""
+            "setfacl" if "setfacl" in result.message else \
+            "pkexec" if "root rights" in result.message else ""
         hint = f" {install_hint(tool)}" if tool else ""
         return ("Required component missing", f"{result.message}.{hint}")
     if code == "EAUTHORIZE":
@@ -918,6 +930,8 @@ class App:
 
         entries = read_mounts()
         own, foreign = find_existing(ref, entries, self.uid)
+        if own is None and not foreign:
+            own, foreign = find_by_address(ref, entries, self.uid)
         if own is not None:
             if path_responds(own.target):
                 mounted_as = own.option("username")
@@ -935,12 +949,16 @@ class App:
                 return 1
             if self.unmount_entry(own, lazy=True) != 0:
                 return 1
-        foreign = foreign or find_foreign_by_address(ref, entries)
-        if foreign is not None:
-            self.ui.notify("Already mounted elsewhere", f"{ref.source} is already mounted at "
-                           f"{foreign.target} (not by {APP_NAME}); opening that.")
-            self.open_folder(self.subfolder(foreign.target, ref))
-            return 0
+        for entry in foreign:
+            # Someone else's mount is only used when it answers and this user
+            # can open it; otherwise this user gets a mount of their own.
+            if path_responds(entry.target) and os.access(entry.target, os.R_OK | os.X_OK):
+                self.ui.notify("Already mounted elsewhere", f"{ref.source} is already mounted at "
+                               f"{entry.target} (not by {APP_NAME}); opening that.")
+                self.open_folder(self.subfolder(entry.target, ref))
+                return 0
+            self.log.info(f"{entry.source} at {entry.target} is not usable by this user; "
+                          f"mounting a separate copy")
 
         port = ref.port or 445
         problem = tcp_probe(ref.host, port)
@@ -978,6 +996,10 @@ class App:
                     return 1
 
         for attempt in range(3):
+            if password is not None and len(password.encode("utf-8", "surrogateescape")) > 512:
+                self.ui.error("Password too long", "The password is longer than 512 bytes, "
+                              "which is the most mount.cifs accepts.")
+                return 1
             result = self.elevator.run_helper(helper, args, password)
             if result.ok or result.code != "EAUTH" or guest or attempt == 2:
                 break
