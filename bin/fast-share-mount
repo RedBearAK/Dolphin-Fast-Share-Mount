@@ -43,8 +43,7 @@ HELPER_CANDIDATES = (
     "/usr/local/libexec/fast-share-mount-helper",
 )
 POLKIT_ACTION = "io.github.redbearak.dolphin-fast-share-mount.mount"
-SERVICE_MENUS = ("dolphin-fast-share-mount.desktop", "dolphin-fast-share-mount-unmount.desktop",
-                 "dolphin-fast-share-mount-unmount-remote.desktop")
+SERVICE_MENUS = ("dolphin-fast-share-mount.desktop", "dolphin-fast-share-mount-unmount.desktop")
 SEARCH_PATH = "/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin"
 LOG_MAX_BYTES = 1024 * 1024
 PROBE_TIMEOUT = 5

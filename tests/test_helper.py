@@ -812,6 +812,14 @@ class PercentEncodeTests(unittest.TestCase):
             self.assertEqual(bash('percent_encode "$1"', text).stdout, expected)
 
 
+class JournalSwitchTests(unittest.TestCase):
+    def test_helper_logs_unless_switched_off(self):
+        stub = 'logger() { printf "%s\\n" "$*"; }; '
+        quiet = bash(stub + 'log info "quiet"', env={"FAST_SHARE_MOUNT_NO_SYSLOG": "1"})
+        heard = bash(stub + 'log info "heard"', env={"FAST_SHARE_MOUNT_NO_SYSLOG": ""})
+        self.assertEqual((quiet.stdout, heard.stdout.split()[-1]), ("", "heard"))
+
+
 class KernelLineAttemptTests(unittest.TestCase):
     def read(self, lines):
         return bash('timeout() { shift; "$@"; }; journalctl() { printf "%s" "$LINES"; }; '

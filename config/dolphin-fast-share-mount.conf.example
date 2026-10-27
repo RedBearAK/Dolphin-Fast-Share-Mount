@@ -22,7 +22,8 @@
 # Save a password you typed: ask, always, or never.
 #remember_password=ask
 
-# Name of the mount folder: a pattern with {share} (required) and any of
+# Name of the mount folder: a pattern of at most 100 characters with
+# {share} (required) and any of
 #   {server_address}       the server as in the address (photos.local)
 #   {server_display_name}  the name it announces, shown in Dolphin's
 #                          network view (Photos), else the short name

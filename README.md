@@ -24,7 +24,7 @@ When kio-fuse is running, Dolphin may hand the menu a kio-fuse folder (`/run/use
 
 Right-click anything, anywhere (a file, a folder or the background, local or remote):
 
-- **Fast Share Unmount…** lists the shares the tool has mounted for you, with the one you clicked in already ticked (in local folders; elsewhere nothing is ticked, so that Dolphin does not first fetch the remote files you clicked). Tick one or more and press OK. A share that is still in use (an open file, a terminal inside it) is reported, with the offer to detach it anyway. With nothing mounted you get a notification instead of the list.
+- **Fast Share Unmount…** lists the shares the tool has mounted for you, with the one you clicked in already ticked. Tick one or more and press OK. A share that is still in use (an open file, a terminal inside it) is reported, with the offer to detach it anyway. With nothing mounted you get a notification instead of the list.
 
 Dolphin's sidebar lists each mount under Remote. Its own **Unmount** (in the entry's context menu) does not work and says "must be superuser to unmount": the mount belongs to root, and the system lets a normal user unmount only what fstab allows. Use **Fast Share Unmount…** instead.
 

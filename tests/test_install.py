@@ -57,6 +57,9 @@ class UserPartTests(unittest.TestCase):
             # empty mount table it never reaches a real helper.
             "FAST_SHARE_MOUNT_MOUNTINFO": "/dev/null",
             "FAST_SHARE_MOUNT_NO_SYSLOG": "1",
+            # without a locale, kreadconfig6 (run by the uninstaller) logs a
+            # warning to the journal
+            "LANG": "C.UTF-8",
         }
         os.makedirs(self.env["XDG_RUNTIME_DIR"], mode=0o700)
         self.command = os.path.join(self.home, ".local/bin/fast-share-mount")
@@ -82,8 +85,7 @@ class UserPartTests(unittest.TestCase):
     def assert_installed(self):
         self.assertTrue(os.path.isfile(self.command) and not os.path.islink(self.command))
         self.assertEqual(stat.S_IMODE(os.stat(self.command).st_mode), 0o755)
-        for name in ("dolphin-fast-share-mount.desktop", "dolphin-fast-share-mount-unmount.desktop",
-                     "dolphin-fast-share-mount-unmount-remote.desktop"):
+        for name in ("dolphin-fast-share-mount.desktop", "dolphin-fast-share-mount-unmount.desktop"):
             path = os.path.join(self.menus, name)
             self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o755, name)
             parser = configparser.ConfigParser(interpolation=None)
@@ -94,19 +96,18 @@ class UserPartTests(unittest.TestCase):
                     exec_line = parser[section]["Exec"]
                     self.assertTrue(exec_line.startswith(f'"{self.command}" '), exec_line)
                     self.assertIn("--gui", exec_line)
-                    # remote locations get no URLs: KIO would download them first
-                    self.assertEqual(exec_line.endswith("%U"), not name.endswith("-remote.desktop"))
+                    self.assertTrue(exec_line.endswith("%U"))
                     self.assertNotIn("%", exec_line.replace("%U", ""))
             if "-unmount" in name:
-                # every file and folder, local (file) or any other protocol, top level
+                # every file and folder, every protocol, top level. No protocol
+                # keys: with %U and none, KIO passes remote URLs through as
+                # they are (checked against KIO 6.31's DesktopExecParser);
+                # without %U, or with protocols listed, it fetches them first.
                 entry = parser["Desktop Entry"]
                 self.assertIn("all/all", entry["MimeType"].split(";"))
                 self.assertNotIn("X-KDE-Submenu", entry)
                 self.assertIn("--choose", parser["Desktop Action unmount"]["Exec"])
-                if name.endswith("-remote.desktop"):
-                    self.assertEqual((entry.get("X-KDE-Protocol"), entry.get("X-KDE-Protocols")), ("!file", None))
-                else:
-                    self.assertEqual((entry.get("X-KDE-Protocol"), entry.get("X-KDE-Protocols")), (None, "file"))
+                self.assertEqual((entry.get("X-KDE-Protocol"), entry.get("X-KDE-Protocols")), (None, None))
             # both in the main menu, never in Dolphin's Actions submenu
             self.assertEqual(parser["Desktop Entry"]["X-KDE-Priority"], "TopLevel", name)
         self.assertTrue(os.path.isfile(self.config))

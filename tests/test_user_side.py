@@ -359,6 +359,13 @@ class CommandLineTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
         self.assertIn("not on a Fast Share Mount mount", result.stderr)
 
+    def test_check_lists_every_component(self):
+        result = self.run_cli("check")
+        for row in ("Kernel CIFS mount", "Root helper", "Share list on a server (kioclient)",
+                    "D-Bus calls (gdbus)", "Saved passwords"):
+            self.assertIn(row, result.stdout + result.stderr)
+        self.assertNotIn("Unexpected error", result.stderr)
+
     def test_choose_with_nothing_mounted(self):
         result = self.run_cli("unmount", "--choose", "/tmp")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -440,7 +447,8 @@ class KioFuseTests(unittest.TestCase):
         argv = self.run.call_args.args[0]
         self.assertEqual(argv[0], "gdbus")
         self.assertIn("org.kde.KIOFuse.VFS.remoteUrl", argv)
-        self.assertEqual(argv[-1], self.FOLDER)
+        # the path follows "--", so gdbus never reads it as an option
+        self.assertEqual(argv[-2:], ["--", self.FOLDER])
 
     def test_fuse_file_url_is_decoded_before_asking(self):
         self.reply("('smb://nas.example.net/Media/My Films',)")
@@ -897,6 +905,10 @@ class NameSettingTests(unittest.TestCase):
             config, warnings = self.parse(f"folder_name={value}")
             self.assertEqual((config["folder_name"], warnings), (expected, []), value)
 
+    def test_folder_name_of_exactly_100_characters_is_accepted(self):
+        config, warnings = self.parse("folder_name={share}" + "x" * 93)
+        self.assertEqual((len(config["folder_name"]), warnings), (100, []))
+
     def test_bad_folder_names_are_refused_with_a_warning(self):
         for value in ("{share}" + "x" * 94, "server-share", "{server}", "{server_address}", "{server_display_name}@{server_short_name}", "{share} [{server_display_name}]", "{share}/{server_address}",
                       "{share}:{server_short_name}", "{Share}", "{share}@{nick}", ""):
@@ -927,6 +939,19 @@ class NameSettingTests(unittest.TestCase):
         cut = fsm.middle_ellipsis("a" * 30 + "b" * 30)
         self.assertEqual(cut, "a" * 20 + "…" + "b" * 19)
         self.assertEqual(len(fsm.middle_ellipsis("x" * 41)), 40)
+
+
+class JournalSwitchTests(unittest.TestCase):
+    def test_journal_is_written_unless_switched_off(self):
+        with mock.patch.object(fsm.syslog, "openlog"), \
+                mock.patch.object(fsm.syslog, "syslog") as sent:
+            with mock.patch.dict(os.environ, {"FAST_SHARE_MOUNT_NO_SYSLOG": "1"}):
+                fsm.Log().info("quiet")
+            sent.assert_not_called()
+            with mock.patch.dict(os.environ):
+                os.environ.pop("FAST_SHARE_MOUNT_NO_SYSLOG")
+                fsm.Log().info("heard")
+            self.assertEqual(sent.call_args.args[1], "heard")
 
 
 class FakeKWallet:
@@ -1252,8 +1277,9 @@ class MountFlowTests(unittest.TestCase):
     def test_remembered_names_file_ignores_bad_lines(self):
         os.makedirs(os.path.dirname(fsm.server_names_path()), exist_ok=True)
         with open(fsm.server_names_path(), "w", encoding="utf-8") as handle:
-            handle.write("nas.example.net\tGood\nno tab here\nbad host!\tX\nlong.example\t" + "x" * 65 + "\n")
-        self.assertEqual(fsm.read_server_names(), {"nas.example.net": "Good"})
+            handle.write("nas.example.net\tGood\nno tab here\nbad host!\tX\nlong.example\t" + "x" * 65 + "\n"
+                         "edge.example\t" + "é" * 32 + "\n")
+        self.assertEqual(fsm.read_server_names(), {"nas.example.net": "Good", "edge.example": "é" * 32})
 
     def test_server_name_and_host_are_different_things(self):
         self.assertEqual(self.names("{share}@{server_address}"), ("Media@nas.example.net", None))
