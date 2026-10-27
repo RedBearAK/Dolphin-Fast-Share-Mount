@@ -362,7 +362,9 @@ kernel_cifs_lines() {
         fi
     } | while IFS= read -r line; do
         [[ ${line,,} == *cifs* ]] || continue
-        line_names_only_host "$line" "$host" && printf '%s\n' "$line"
+        if line_names_only_host "$line" "$host"; then
+            printf '%s\n' "$line"
+        fi
     done | tail -n 4
 }
 
@@ -381,6 +383,7 @@ line_names_only_host() {
 # mount point). The lock is held on the user's folder until the helper exits.
 lock_user_root() {
     local uid=$1
+    command -v flock >/dev/null || fail EMISSING "flock is missing (package util-linux)"
     exec 8<"$MOUNT_BASE/$uid" || fail EINTERNAL "Could not open the user's mount folder" "$MOUNT_BASE/$uid"
     flock -w "$LOCK_WAIT" 8 || fail EBUSY "Another mount or unmount of this user is still running"
 }

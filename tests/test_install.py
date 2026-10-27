@@ -298,6 +298,22 @@ class SystemPartTests(unittest.TestCase):
             with open(marker, encoding="utf-8") as handle:
                 self.assertEqual(handle.read(), "the user's installed command")
 
+    def test_policy_kept_while_another_prefix_remains(self):
+        for prefix in ("/usr/local", "/usr"):
+            result = self.script(INSTALLER, "--system-only", "--prefix", prefix)
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        result = self.script(UNINSTALLER, "--system-only", "--prefix", "/usr/local")
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertIn(f"usr/share/polkit-1/actions/{POLICY}", all_files(self.dest))
+        result = self.script(UNINSTALLER, "--system-only", "--prefix", "/usr")
+        self.assertEqual(all_files(self.dest), [])
+
+    def test_destdir_with_user_only_is_refused(self):
+        for script in (INSTALLER, UNINSTALLER):
+            result = self.script(script, "--user-only")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("only applies to the system part", result.stderr)
+
     def test_prefix_usr(self):
         result = self.script(INSTALLER, "--system-only", "--prefix", "/usr")
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)

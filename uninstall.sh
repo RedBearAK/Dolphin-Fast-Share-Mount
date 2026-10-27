@@ -78,6 +78,8 @@ remove_listed() {
     [[ -f $manifest && ! -L $manifest ]] || return 0
     while IFS= read -r path; do
         [[ -n $path ]] || continue
+        # The polkit action is shared by both prefixes; uninstall_system decides.
+        [[ $path != */polkit-1/actions/"$POLICY_NAME" ]] || continue
         path=$staging$path
         local root allowed=""
         for root in "$@"; do
@@ -175,7 +177,13 @@ uninstall_system() {
         fi
         remove_tree "$root$share_dir"
     done
-    remove_file "$root/usr/share/polkit-1/actions/$POLICY_NAME"
+    # The polkit action is shared by both prefixes; keep it while an
+    # installation under the other prefix remains.
+    if [[ ! -f $root/usr/share/$APP_ID/installed-files.txt && ! -f $root/usr/local/share/$APP_ID/installed-files.txt ]]; then
+        remove_file "$root/usr/share/polkit-1/actions/$POLICY_NAME"
+    else
+        say "  kept the polkit action: another installation remains"
+    fi
     say "System part removed."
 }
 
@@ -287,6 +295,7 @@ main() {
             uninstall_system
             ;;
         user)
+            [[ -z $DESTDIR ]] || die "DESTDIR only applies to the system part"
             uninstall_user unmount
             ;;
         both)

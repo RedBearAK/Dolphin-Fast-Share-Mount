@@ -518,6 +518,16 @@ class KernelLineTests(unittest.TestCase):
         ])
 
 
+class KernelLineExitTests(unittest.TestCase):
+    def test_trailing_line_about_another_server_does_not_stop_the_helper(self):
+        lines = "CIFS: VFS: \\\\nas Dialect not supported\nCIFS: VFS: \\\\otherbox Send error\n"
+        result = bash('timeout() { shift; "$@"; }; journalctl() { printf "%s" "$LINES"; }; '
+                      'kernel=$(kernel_cifs_lines 0 nas); printf "reached|%s" "$kernel"',
+                      env={"LINES": lines})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "reached|CIFS: VFS: \\\\nas Dialect not supported")
+
+
 class LockTests(unittest.TestCase):
     def test_second_run_waits_and_gives_up(self):
         import fcntl

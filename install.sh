@@ -258,6 +258,7 @@ main() {
             install_system
             ;;
         user)
+            [[ -z $DESTDIR ]] || die "DESTDIR only applies to the system part"
             install_user
             ;;
         both)
