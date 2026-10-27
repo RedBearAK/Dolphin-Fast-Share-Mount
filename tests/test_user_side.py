@@ -401,7 +401,11 @@ class KioFuseTests(unittest.TestCase):
     FOLDER = "/run/user/1000/kio-fuse-AbCdEf/smb/jordan@nas.example.net/Media/Films"
 
     def setUp(self):
-        mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": self.RUNTIME}).start()
+        home = tempfile.TemporaryDirectory()
+        self.addCleanup(home.cleanup)
+        mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": self.RUNTIME, "HOME": home.name,
+                                     "XDG_CONFIG_HOME": f"{home.name}/config",
+                                     "XDG_STATE_HOME": f"{home.name}/state"}).start()
         self.run = mock.patch.object(fsm, "run").start()
         self.addCleanup(mock.patch.stopall)
 

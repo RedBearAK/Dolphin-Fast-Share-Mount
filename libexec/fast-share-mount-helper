@@ -289,9 +289,10 @@ classify_other_error() {
 # The kernel lines of this attempt: those after the last "Attempting to
 # mount SOURCE" line. mount.cifs tries each address of a server in turn, so
 # the last such line is the attempt that failed. ATTEMPT_MIXED is set when
-# another mount's attempt shows up in the window (kernel_cifs_lines turns
-# those into "Attempting to mount (another share)"): its status lines carry
-# no server name and cannot be told from ours.
+# another mount's attempt starts after ours (kernel_cifs_lines turns those
+# into "Attempting to mount (another share)"); each of our own attempt lines
+# clears it, because attempts before ours do not count (without journalctl
+# the lines come from all of dmesg).
 ATTEMPT="" ATTEMPT_FOUND="" ATTEMPT_MIXED=""
 attempt_lines() {
     local kernel=$1 source=$2 line
@@ -300,7 +301,7 @@ attempt_lines() {
     while IFS= read -r line; do
         if [[ $line == *"Attempting to mount "* ]]; then
             if [[ ${line##*Attempting to mount } == "$source" ]]; then
-                ATTEMPT="" ATTEMPT_FOUND=1
+                ATTEMPT="" ATTEMPT_FOUND=1 ATTEMPT_MIXED=""
             else
                 ATTEMPT_MIXED=1
             fi
@@ -313,21 +314,28 @@ attempt_lines() {
 }
 
 # A failed login and a refused share both end in mount error 13 (EACCES).
-# Only the kernel's lines tell them apart: a failed login names its status
-# or reports that the SMB session failed, a share refused after a good login
-# shows neither. That is only concluded when this attempt's lines are
-# complete (up to "cifs_mount failed ... -13") and no other mount's lines are
-# mixed in; otherwise the message stays open to both causes. Expired and
+# Only the kernel's lines tell them apart. A failed login always logs
+# "\\host failed to create a new SMB session", which names our server (other
+# servers' lines are filtered out); its "Status code returned STATUS_..."
+# line names no server, so a status counts only next to that session line.
+# A share refused after a good login logs neither; that is only concluded
+# when this attempt's lines are complete (up to "cifs_mount failed ... -13")
+# and hold no status line at all, since a stray one may be another mount's
+# (a reconnect). Otherwise the message stays open to both causes. Expired and
 # disabled accounts arrive as 127 (EKEYEXPIRED) and 128 (EKEYREVOKED);
 # STATUS_NO_SUCH_USER and STATUS_PASSWORD_MUST_CHANGE as 5 (EIO), which is
 # only an account error when the status says so (returns 1 otherwise).
 classify_access_error() {
     local number=$1 kernel=$2 source=$3 text="" status=""
     attempt_lines "$kernel" "$source"
+    local session=""
     if [[ -n $ATTEMPT_FOUND && -z $ATTEMPT_MIXED ]]; then
         text=$ATTEMPT
     fi
-    if [[ $text =~ STATUS_(ACCOUNT_[A-Z_]+|PASSWORD_EXPIRED|PASSWORD_MUST_CHANGE|INVALID_LOGON_HOURS|INVALID_WORKSTATION) ]]; then
+    if [[ $text == *"failed to create a new SMB session"* ]]; then
+        session=1
+    fi
+    if [[ -n $session && $text =~ STATUS_(ACCOUNT_[A-Z_]+|PASSWORD_EXPIRED|PASSWORD_MUST_CHANGE|INVALID_LOGON_HOURS|INVALID_WORKSTATION) ]]; then
         status=${BASH_REMATCH[0]}
         CLASS_CODE=EDENIED
         CLASS_MESSAGE="The server refused this account ($status)"
@@ -337,16 +345,15 @@ classify_access_error() {
     elif [[ $number == 128 ]]; then
         CLASS_CODE=EDENIED
         CLASS_MESSAGE="The server refused this account (the account is disabled)"
-    elif [[ $text == *STATUS_NO_SUCH_USER* ]]; then
+    elif [[ -n $session && $text == *STATUS_NO_SUCH_USER* ]]; then
         CLASS_CODE=EAUTH
         CLASS_MESSAGE="Login failed: wrong user name or password"
     elif [[ $number == 5 ]]; then
         return 1
-    elif [[ $text == *STATUS_LOGON_FAILURE* || $text == *STATUS_WRONG_PASSWORD* \
-            || $text == *"failed to create a new SMB session"* ]]; then
+    elif [[ -n $session ]]; then
         CLASS_CODE=EAUTH
         CLASS_MESSAGE="Login failed: wrong user name or password"
-    elif [[ $text == *"cifs_mount failed w/return code = -13"* ]]; then
+    elif [[ $text != *STATUS_* && $text == *"cifs_mount failed w/return code = -13"* ]]; then
         CLASS_CODE=EDENIED
         CLASS_MESSAGE="The login worked, but the server refused access to the share"
     else

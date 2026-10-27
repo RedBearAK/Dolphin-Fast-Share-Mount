@@ -12,6 +12,7 @@ import os
 import stat
 import subprocess
 import tempfile
+import time
 import textwrap
 import unittest
 
@@ -253,6 +254,21 @@ class ErrorTests(unittest.TestCase):
                                           "\nCIFS: Status code returned 0xc000006d STATUS_LOGON_FAILURE"),
                          ("EAUTH", self.OPEN))
 
+    def test_attempts_before_ours_do_not_count(self):
+        # without journalctl the lines come from all of dmesg
+        earlier = self.OTHER + "\nCIFS: VFS: cifs_mount failed w/return code = -2\n"
+        self.assertEqual(self.sort_access(earlier + self.WRONG_PASSWORD),
+                         ("EAUTH", "Login failed: wrong user name or password"))
+        self.assertEqual(self.sort_access(earlier + self.SHARE_REFUSED)[0], "EDENIED")
+
+    def test_status_line_without_our_session_line_proves_nothing(self):
+        # status lines name no server: this one may be another mount's reconnect
+        for status in ("0xc000006d STATUS_LOGON_FAILURE", "0xc0000071 STATUS_PASSWORD_EXPIRED",
+                       "0xc0000234 STATUS_ACCOUNT_LOCKED_OUT"):
+            stray = self.SHARE_REFUSED.replace(
+                "CIFS: VFS: cifs_mount", f"CIFS: Status code returned {status}\nCIFS: VFS: cifs_mount")
+            self.assertEqual(self.sort_access(stray), ("EAUTH", self.OPEN), status)
+
     def test_refused_account_names_its_status(self):
         for status in ("STATUS_ACCOUNT_LOCKED_OUT", "STATUS_ACCOUNT_RESTRICTION",
                        "STATUS_INVALID_LOGON_HOURS", "STATUS_INVALID_WORKSTATION"):
@@ -399,6 +415,16 @@ class MountFlowTests(unittest.TestCase):
     def read(self, name):
         with open(os.path.join(self.stub_dir, name), encoding="utf-8") as handle:
             return handle.read()
+
+    def test_kernel_lines_are_read_from_below_the_second(self):
+        before = time.time()
+        result = self.mount("--uid", "1000", "--host", "NAS", "--share", "Media", "--user", "kris",
+                            mode="auth",
+                            extra='kernel_cifs_lines() { printf "%s" "$1" > "$STUB_DIR/since"; }; ')
+        self.assertEqual(result.returncode, 10, result.stderr)
+        since = self.read("since")
+        self.assertRegex(since, r"^[0-9]+\.[0-9]{9}$")
+        self.assertLessEqual(abs(float(since) - before), 5)
 
     def test_success_passes_password_only_through_the_pipe(self):
         secret = " p@ss, word=1 %x\\y "

@@ -42,7 +42,8 @@ One folder per server keeps shares with generic names (`Shared`, `Media`, `Backu
 - `/usr/bin/python3` 3.10 or later (standard library only)
 - `pkexec` (polkit), or `sudo` with `ksshaskpass`
 - `kdialog` (or `zenity`) for the password prompt and dialogs
-- Optional: `notify-send` for notifications; KWallet (`kwallet-query` and `gdbus`) or libsecret (`secret-tool`) to remember passwords
+- `gdbus` (glib2 tools), to find the address behind a kio-fuse folder and to use KWallet
+- Optional: `notify-send` for notifications; KWallet (`kwallet-query`) or libsecret (`secret-tool`) to remember passwords
 
 On openSUSE:
 
