@@ -812,17 +812,33 @@ class OpenFoldersTests(unittest.TestCase):
         self.addCleanup(mock.patch.stopall)
         return app
 
-    def test_several_mounts_open_with_one_dolphin_call(self):
-        app = self.app("tab", ["smb://nas/A", "smb://nas/B", "smb://nas/A/sub"])
-        self.assertEqual(app.cmd_mount(), 0)
-        self.assertEqual([c.args[0] for c in self.popen.call_args_list],
-                         [["/usr/bin/dolphin", "/m/A", "/m/B"]])
+    ROOT = "/run/dolphin-fast-share-mount/1000"
 
-    def test_new_window_mode_opens_one_window_with_all(self):
-        app = self.app("window", ["smb://nas/A", "smb://nas/B"])
+    def test_one_mount_opens_itself(self):
+        app = self.app("tab", ["smb://nas/A"])
+        app.uid = 1000
+        app.mount_one = lambda ref: app.open_folder(f"{self.ROOT}/nas/Nas-A/sub") or 0
         app.cmd_mount()
         self.assertEqual([c.args[0] for c in self.popen.call_args_list],
-                         [["/usr/bin/dolphin", "--new-window", "/m/A", "/m/B"]])
+                         [["/usr/bin/dolphin", f"{self.ROOT}/nas/Nas-A/sub"]])
+
+    def test_several_mounts_open_their_server_folder_once(self):
+        app = self.app("tab", ["smb://nas/A", "smb://nas/B", "smb://other/C", "smb://nas/D"])
+        app.uid = 1000
+        places = {"A": f"{self.ROOT}/nas/Nas-A/sub", "B": f"{self.ROOT}/nas/Nas-B",
+                  "C": f"{self.ROOT}/other/Other-C", "D": "/mnt/fstab-d"}
+        app.mount_one = lambda ref: app.open_folder(places[ref.share]) or 0
+        self.assertEqual(app.cmd_mount(), 0)
+        self.assertEqual([c.args[0] for c in self.popen.call_args_list],
+                         [["/usr/bin/dolphin", f"{self.ROOT}/nas", f"{self.ROOT}/other", "/mnt/fstab-d"]])
+
+    def test_new_window_mode_opens_one_window(self):
+        app = self.app("window", ["smb://nas/A", "smb://nas/B"])
+        app.uid = 1000
+        app.mount_one = lambda ref: app.open_folder(f"{self.ROOT}/nas/Nas-{ref.share}") or 0
+        app.cmd_mount()
+        self.assertEqual([c.args[0] for c in self.popen.call_args_list],
+                         [["/usr/bin/dolphin", "--new-window", f"{self.ROOT}/nas"]])
 
     def test_none_mode_opens_nothing(self):
         app = self.app("none", ["smb://nas/A"])

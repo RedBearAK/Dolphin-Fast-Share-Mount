@@ -1219,8 +1219,22 @@ class App:
                 status = max(status, self.mount_one(ref))
         finally:
             folders, self.to_open = self.to_open, None
-            self.launch_folders(folders)
+            self.launch_folders(self.folders_to_show(folders))
         return status
+
+    def folders_to_show(self, paths: list) -> list:
+        """One folder opens as it is; several of this tool's mounts open as
+        their server's folder, which lists them all (one per server)."""
+        if len(paths) < 2:
+            return paths
+        root = own_root(self.uid) + "/"
+        shown = []
+        for path in paths:
+            if path.startswith(root):
+                path = root + path[len(root):].split("/", 1)[0]
+            if path not in shown:
+                shown.append(path)
+        return shown
 
     def pick_shares(self, root: "ServerRoot") -> tuple:
         """(smb:// addresses of the shares picked on a server, error status)."""
