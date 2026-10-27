@@ -854,13 +854,13 @@ class NameSettingTests(unittest.TestCase):
 
     def test_folder_name_templates_and_aliases(self):
         for value, expected in (("{share}@{server_display_name}", "{share}@{server_display_name}"), ("share", "{share}"),
-                                ("server-share", "{server_display_name}-{share}"), ("{share}+{server_address}", "{share}+{server_address}"),
+                                ("{share}+{server_address}", "{share}+{server_address}"),
                                 ("{server_short_name}_{share}", "{server_short_name}_{share}")):
             config, warnings = self.parse(f"folder_name={value}")
             self.assertEqual((config["folder_name"], warnings), (expected, []), value)
 
     def test_bad_folder_names_are_refused_with_a_warning(self):
-        for value in ("{server_address}", "{server_display_name}@{server_short_name}", "{share} [{server_display_name}]", "{share}/{server_address}",
+        for value in ("server-share", "{server}", "{server_address}", "{server_display_name}@{server_short_name}", "{share} [{server_display_name}]", "{share}/{server_address}",
                       "{share}:{server_short_name}", "{Share}", "{share}@{nick}", ""):
             config, warnings = self.parse(f"folder_name={value}")
             self.assertEqual(config["folder_name"], "{share}@{server_display_name}", value)

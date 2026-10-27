@@ -64,7 +64,7 @@ CONFIG_CHOICES = {
     "open_mode": ("tab", "window", "none"),
     "remember_password": ("ask", "always", "never"),
 }
-FOLDER_NAME_ALIASES = {"server-share": "{server_display_name}-{share}", "share": "{share}"}
+FOLDER_NAME_ALIASES = {"share": "{share}"}
 SIDEBAR_NAME_LIMIT = 40
 # {share}: the share. {server_address}: the server as in the address
 # (photos.local, photos.example.net or an IP address). {server_display_name}:
