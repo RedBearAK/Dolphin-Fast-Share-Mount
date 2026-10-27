@@ -3,10 +3,12 @@
 SPDX-License-Identifier: GPL-3.0-or-later
 """
 
+import atexit
 import importlib.machinery
 import importlib.util
 import os
 import sys
+import tempfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FIXTURES = os.path.join(ROOT, "tests", "fixtures")
@@ -16,6 +18,18 @@ INSTALLER = os.path.join(ROOT, "install.sh")
 UNINSTALLER = os.path.join(ROOT, "uninstall.sh")
 
 sys.dont_write_bytecode = True
+
+# Every test runs with a throwaway home: no test reads the developer's
+# settings or writes their state, and nothing goes to the system journal.
+_HOME = tempfile.TemporaryDirectory(prefix="dfsm-test-home-")
+atexit.register(_HOME.cleanup)
+os.environ.update({
+    "HOME": _HOME.name,
+    "XDG_CONFIG_HOME": os.path.join(_HOME.name, "config"),
+    "XDG_STATE_HOME": os.path.join(_HOME.name, "state"),
+    "XDG_DATA_HOME": os.path.join(_HOME.name, "data"),
+    "FAST_SHARE_MOUNT_NO_SYSLOG": "1",
+})
 
 
 def load_user_side():

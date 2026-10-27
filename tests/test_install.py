@@ -56,6 +56,7 @@ class UserPartTests(unittest.TestCase):
             # The uninstaller runs "fast-share-mount unmount --all"; with an
             # empty mount table it never reaches a real helper.
             "FAST_SHARE_MOUNT_MOUNTINFO": "/dev/null",
+            "FAST_SHARE_MOUNT_NO_SYSLOG": "1",
         }
         os.makedirs(self.env["XDG_RUNTIME_DIR"], mode=0o700)
         self.command = os.path.join(self.home, ".local/bin/fast-share-mount")
@@ -239,7 +240,7 @@ class SystemPartTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.dest = self.tmp.name
         self.env = {"DESTDIR": self.dest, "PATH": "/usr/local/bin:/usr/bin:/bin",
-                    "HOME": self.dest}
+                    "HOME": self.dest, "FAST_SHARE_MOUNT_NO_SYSLOG": "1"}
 
     def tearDown(self):
         self.tmp.cleanup()

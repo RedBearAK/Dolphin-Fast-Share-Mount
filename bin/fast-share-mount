@@ -199,9 +199,12 @@ def parse_smb_url(url: str) -> ShareRef:
     if not is_valid_host(host):
         raise UsageError(f"Server name not supported: {host}")
     if not segments:
+        # The address for kioclient and the picked shares, without a
+        # password (it would be visible in the process list).
+        login = userinfo.split(":", 1)[0] + "@" if has_user else ""
         raise ServerRoot(
             f"smb://{host}/ is a server or workgroup, not a share. Open one of its shares first.",
-            f"smb://{parts.netloc}/", host, port)
+            f"smb://{login}{hostport}/", host, port)
     share, subpath = segments[0], tuple(segments[1:])
     if not is_valid_share(share):
         raise UsageError(f"Share name not supported: {share}")
@@ -314,7 +317,10 @@ class Log:
     def __init__(self, debug: bool = False):
         self.debug_enabled = debug
         self.path = os.path.join(state_dir(), "log")
-        syslog.openlog(COMMAND, syslog.LOG_PID, syslog.LOG_USER)
+        # The test suite sets this, so that it leaves nothing in the journal.
+        self.to_journal = not os.environ.get("FAST_SHARE_MOUNT_NO_SYSLOG")
+        if self.to_journal:
+            syslog.openlog(COMMAND, syslog.LOG_PID, syslog.LOG_USER)
 
     def write(self, level: str, message: str) -> None:
         if level == "debug" and not self.debug_enabled:
@@ -324,7 +330,8 @@ class Log:
         # are not UTF-8 (kept as surrogates); write them as escapes.
         message = message.encode("utf-8", "backslashreplace").decode("utf-8")
         try:
-            syslog.syslog(self.PRIORITIES[level], message)
+            if self.to_journal:
+                syslog.syslog(self.PRIORITIES[level], message)
         except (OSError, ValueError):
             pass
         try:
@@ -1711,6 +1718,9 @@ class App:
         else:
             problems += 1
             row("Dialogs and password prompt", "MISSING", install_hint("kdialog"))
+        kioclient = next((t for t in ("kioclient6", "kioclient", "kioclient5") if which(t)), None)
+        row("Share list on a server (kioclient)", "ok" if kioclient else "none",
+            which(kioclient) if kioclient else "open a share instead of the server")
         if which("gdbus"):
             row("D-Bus calls (gdbus)", "ok", which("gdbus"))
         else:

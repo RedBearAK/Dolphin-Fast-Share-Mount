@@ -332,6 +332,10 @@ class ErrorTests(unittest.TestCase):
         # lines without the attempt's start (cut off) do not prove a refused share
         self.assertEqual(self.sort_access("CIFS: VFS: cifs_mount failed w/return code = -13"),
                          ("EAUTH", self.OPEN))
+        # an attempt cut off after some of its lines proves nothing either
+        self.assertEqual(self.sort_access("CIFS: Attempting to mount //127.0.0.1/Shared\n"
+                                          "CIFS: VFS: \\\\127.0.0.1 Send error in SessSetup = -13"),
+                         ("EAUTH", self.OPEN))
         # no source given: nothing can be anchored
         self.assertEqual(self.sort_access(self.SHARE_REFUSED, source=""), ("EAUTH", self.OPEN))
 
@@ -489,6 +493,26 @@ class MountFlowTests(unittest.TestCase):
         options = self.read("mount-argv").splitlines()[3].split(",")
         self.assertIn("x-gvfs-name=Backups%20%5BJordan%27s%20NAS%5D", options)
         self.assertIn("x-gvfs-icon=folder-remote", options)
+
+    def test_refused_share_reaches_the_caller_as_edenied(self):
+        # cmd_mount must hand its source to the error sorting
+        kernel = "CIFS: Attempting to mount //nas/Media\nCIFS: VFS: cifs_mount failed w/return code = -13"
+        result = self.mount("--uid", "1000", "--host", "nas", "--share", "Media", "--user", "kris",
+                            mode="auth", kernel=kernel)
+        self.assertEqual(result.returncode, 19, result.stderr)
+        self.assertTrue(result.stderr.startswith("EDENIED\t"))
+
+    def test_guest_mount_goes_through_mount(self):
+        result = self.mount("--uid", "1000", "--host", "nas", "--share", "Public", "--guest")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.read("mount-argv").splitlines()[:2],
+                         ["//nas/Public", f"{self.base}/1000/nas/Public"])
+
+    def test_missing_mount_command_is_reported(self):
+        result = self.mount("--uid", "1000", "--host", "nas", "--share", "Media", "--user", "kris",
+                            extra='command() { [[ $1 == -v && $2 == mount ]] && return 1; builtin command "$@"; }; ')
+        self.assertEqual(result.returncode, 16, result.stderr)
+        self.assertIn("mount is missing (package util-linux)", result.stderr)
 
     def test_long_share_name_mounts_under_a_long_folder_request(self):
         share = "s" * 255

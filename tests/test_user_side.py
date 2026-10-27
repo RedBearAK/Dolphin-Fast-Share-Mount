@@ -322,7 +322,7 @@ class CommandLineTests(unittest.TestCase):
                    "DBUS_SESSION_BUS_ADDRESS": "unix:path=/nonexistent",
                    # An empty mount table: these runs must never reach a real
                    # helper and unmount the developer's own shares.
-                   "FAST_SHARE_MOUNT_MOUNTINFO": "/dev/null"}
+                   "FAST_SHARE_MOUNT_MOUNTINFO": "/dev/null", "FAST_SHARE_MOUNT_NO_SYSLOG": "1"}
             return subprocess.run([USER_SIDE, *args], capture_output=True, text=True, env=env,
                                   stdin=subprocess.DEVNULL, timeout=60, check=False)
 
@@ -348,7 +348,8 @@ class CommandLineTests(unittest.TestCase):
         self.assertNotIn("Unexpected error", result.stderr)
 
     def test_server_that_does_not_answer(self):
-        result = self.run_cli("mount", "--no-open", "smb://nas.invalid/")
+        # an explicit port: no name lookup, no fallback to port 139
+        result = self.run_cli("mount", "--no-open", "smb://127.0.0.1:1/")
         self.assertEqual(result.returncode, 1)
         self.assertIn("does not answer as a server", result.stderr)
         self.assertIn("workgroup", result.stderr)
@@ -402,7 +403,7 @@ class OutputTests(unittest.TestCase):
             env = {"HOME": home, "PATH": "/usr/bin:/bin", "LANG": "C.UTF-8",
                    "XDG_RUNTIME_DIR": home, "XDG_STATE_HOME": os.path.join(home, "state"),
                    "XDG_CONFIG_HOME": config, "DBUS_SESSION_BUS_ADDRESS": "unix:path=/nonexistent",
-                   "FAST_SHARE_MOUNT_MOUNTINFO": "/dev/null"}
+                   "FAST_SHARE_MOUNT_MOUNTINFO": "/dev/null", "FAST_SHARE_MOUNT_NO_SYSLOG": "1"}
             result = subprocess.run([os.fsencode(USER_SIDE), b"unmount", b"/tmp/caf\xe9"],
                                     capture_output=True, env=env, stdin=subprocess.DEVNULL,
                                     timeout=60, check=False)
@@ -781,6 +782,29 @@ class SharePickerTests(unittest.TestCase):
         self.assertEqual(self.offered[0][3], "All 2 shares on nas.example.net")
         self.assertEqual([(r.share, r.user, r.host) for r in self.mounted],
                          [("Media", "jordan", "nas.example.net"), ("Backups", "jordan", "nas.example.net")])
+
+    def test_port_139_is_tried_before_giving_up(self):
+        app = self.app("smb://nas.example.net/", [0])
+        fsm.tcp_probe.side_effect = ["connection refused on port 445", None]
+        self.assertEqual(app.cmd_mount(), 0)
+        self.assertEqual([r.share for r in self.mounted], ["Backups"])
+
+    def test_share_names_with_url_characters_survive_the_round_trip(self):
+        app = self.app("smb://nas.example.net/", [0, 1, 2], shares=("A#B", "50%25", "a b"))
+        self.assertEqual(app.cmd_mount(), 0)
+        self.assertEqual(sorted(r.share for r in self.mounted), ["50%25", "A#B", "a b"])
+
+    def test_password_in_the_address_is_not_passed_on(self):
+        try:
+            fsm.parse_smb_url("smb://WORK;jordan:hunter2@nas.example.net:4445/")
+        except fsm.ServerRoot as root:
+            self.assertEqual(root.url, "smb://WORK;jordan@nas.example.net:4445/")
+        else:
+            self.fail("not a server root")
+        app = self.app("smb://jordan:hunter2@nas.example.net/", [0])
+        self.assertEqual(app.cmd_mount(), 0)
+        self.assertEqual(fsm.list_shares.call_args.args[0], "smb://jordan@nas.example.net/")
+        self.assertEqual(self.mounted[0].user, "jordan")
 
     def test_mounted_shares_are_marked(self):
         own = fsm.MountEntry("/run/dolphin-fast-share-mount/1000/nas.example.net/Nas-Media",

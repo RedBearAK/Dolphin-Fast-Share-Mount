@@ -61,6 +61,8 @@ PASSWORD=""
 log() {
     local priority=$1
     shift
+    # The test suite sets this (sudo and pkexec clear the environment).
+    [[ -z ${FAST_SHARE_MOUNT_NO_SYSLOG:-} ]] || return 0
     logger -t "$LOG_TAG" -p "user.$priority" -- "$*" 2>/dev/null || true
 }
 
