@@ -341,6 +341,12 @@ class CommandLineTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn("names no server", result.stderr)
 
+    def test_server_root_with_an_impossible_name(self):
+        result = self.run_cli("mount", "--no-open", "smb://" + "a" * 70 + "/")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("Server name not supported", result.stderr)
+        self.assertNotIn("Unexpected error", result.stderr)
+
     def test_server_that_does_not_answer(self):
         result = self.run_cli("mount", "--no-open", "smb://nas.invalid/")
         self.assertEqual(result.returncode, 1)
@@ -860,7 +866,7 @@ class NameSettingTests(unittest.TestCase):
             self.assertEqual((config["folder_name"], warnings), (expected, []), value)
 
     def test_bad_folder_names_are_refused_with_a_warning(self):
-        for value in ("server-share", "{server}", "{server_address}", "{server_display_name}@{server_short_name}", "{share} [{server_display_name}]", "{share}/{server_address}",
+        for value in ("{share}" + "x" * 94, "server-share", "{server}", "{server_address}", "{server_display_name}@{server_short_name}", "{share} [{server_display_name}]", "{share}/{server_address}",
                       "{share}:{server_short_name}", "{Share}", "{share}@{nick}", ""):
             config, warnings = self.parse(f"folder_name={value}")
             self.assertEqual(config["folder_name"], "{share}@{server_display_name}", value)
@@ -921,6 +927,8 @@ class FakeKWallet:
         if argv[0] == "gdbus":
             method = argv[argv.index("--method") + 1].rsplit(".", 1)[1]
             args = argv[argv.index("--method") + 2:]
+            assert args[:1] == ["--"], "arguments must follow -- (a key may start with -)"
+            args = args[1:]
             if method == "open":
                 return done("(1234,)")
             if method == "createFolder":
@@ -1174,7 +1182,41 @@ class MountFlowTests(unittest.TestCase):
 
     def test_default_is_share_at_name_and_sidebar_follows(self):
         self.assertEqual(self.names(), ("Media@Jordan's NAS", None))
-        self.assertEqual(self.names(announced=None), ("Media@nas", None))
+        self.assertEqual(self.names(announced=None, url="smb://quiet.example.net/Media"),
+                         ("Media@quiet", None))
+
+    def test_announced_name_is_remembered_for_a_server_that_does_not_answer(self):
+        self.assertEqual(self.names(), ("Media@Jordan's NAS", None))
+        self.assertEqual(self.names(announced=None), ("Media@Jordan's NAS", None))
+        self.assertEqual(self.names(announced="Renamed NAS"), ("Media@Renamed NAS", None))
+        self.assertEqual(self.names(announced=None), ("Media@Renamed NAS", None))
+        with open(fsm.server_names_path(), encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), "nas.example.net\tRenamed NAS\n")
+
+    def test_folder_request_is_cut_to_what_the_helper_takes(self):
+        share = "Ö" * 120
+        folder, _ = self.names("{share}{share}{share}{share}{share}", url=f"smb://nas/{share}")
+        self.assertLessEqual(len(folder.encode("utf-8")), 1000)
+        self.assertGreater(len(folder.encode("utf-8")), 990)
+        self.assertTrue(folder.isprintable())
+
+    def test_announced_name_with_control_characters_is_stored_clean(self):
+        self.assertEqual(self.names(announced="Evil\tNAS\nnext.host\tX"), ("Media@EvilNASnext.hostX", None))
+        with open(fsm.server_names_path(), encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), "nas.example.net\tEvilNASnext.hostX\n")
+
+    def test_announced_name_is_asked_once_per_run(self):
+        app = self.app(FakeUI(passwords=["pw", "pw"]), helper_results=[self.ok(), self.ok()])
+        fsm.server_display_name.return_value = "Jordan's NAS"
+        app.mount_one(fsm.parse_smb_url("smb://nas.example.net/Media"))
+        app.mount_one(fsm.parse_smb_url("smb://nas.example.net/Backups"))
+        self.assertEqual(fsm.server_display_name.call_count, 1)
+
+    def test_remembered_names_file_ignores_bad_lines(self):
+        os.makedirs(os.path.dirname(fsm.server_names_path()), exist_ok=True)
+        with open(fsm.server_names_path(), "w", encoding="utf-8") as handle:
+            handle.write("nas.example.net\tGood\nno tab here\nbad host!\tX\nlong.example\t" + "x" * 65 + "\n")
+        self.assertEqual(fsm.read_server_names(), {"nas.example.net": "Good"})
 
     def test_server_name_and_host_are_different_things(self):
         self.assertEqual(self.names("{share}@{server_address}"), ("Media@nas.example.net", None))

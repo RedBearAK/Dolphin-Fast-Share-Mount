@@ -339,6 +339,14 @@ class ErrorTests(unittest.TestCase):
         result = bash('fail EDENIED "x"')
         self.assertEqual(result.returncode, 19)
 
+    def test_old_dialect_line_does_not_decide(self):
+        kernel = "CIFS: VFS: \\\\127.0.0.1 Dialect not supported by server\n" + self.WRONG_PASSWORD
+        self.assertEqual(self.sort_access(kernel), ("EAUTH", "Login failed: wrong user name or password"))
+        refused = "CIFS: Attempting to mount //127.0.0.1/Shared\nCIFS: VFS: \\\\127.0.0.1 Dialect not supported by server"
+        result = bash('classify_mount_error 32 "$1" "$2" "$3"; printf "%s" "$CLASS_CODE"',
+                      "mount error(112): Host is down", refused, self.SOURCE)
+        self.assertEqual(result.stdout, "EDIALECT")
+
     def test_fail_line_and_status(self):
         result = bash('fail EAUTH "Login failed" "$1"', "detail with\ttab\nand newline")
         self.assertEqual(result.returncode, 10)
@@ -415,12 +423,21 @@ class MountFlowTests(unittest.TestCase):
             handle.write(STUB_MOUNT_CIFS)
         os.chmod(stub, 0o755)
         # mount(8) as util-linux runs it: "-t cifs" picks the helper, which
-        # gets the rest of the command line and the environment unchanged.
+        # gets source, target and the options without the x- ones (mount
+        # keeps those in /run/mount/utab), with the environment unchanged.
         stub = os.path.join(self.stub_dir, "mount")
         with open(stub, "w", encoding="utf-8") as handle:
-            handle.write('#!/bin/bash\n[[ $1 == -t && $2 == cifs ]] || exit 99\n'
-                         'shift 2\nprintf "%s\\n" "$@" > "$STUB_DIR/mount-argv"\n'
-                         'exec "$STUB_DIR/mount.cifs" "$@"\n')
+            handle.write(textwrap.dedent("""\
+                #!/bin/bash
+                [[ $1 == -t && $2 == cifs && $5 == -o ]] || exit 99
+                printf '%s\\n' "${@:3}" > "$STUB_DIR/mount-argv"
+                IFS=, read -ra all <<< "$6"
+                kept=()
+                for option in "${all[@]}"; do
+                    [[ $option == x-* ]] || kept+=("$option")
+                done
+                exec "$STUB_DIR/mount.cifs" "$3" "$4" -o "$(IFS=,; echo "${kept[*]}")"
+                """))
         os.chmod(stub, 0o755)
         self.mountinfo = os.path.join(self.dir, "mountinfo")
         with open(self.mountinfo, "w", encoding="utf-8") as handle:
@@ -469,26 +486,34 @@ class MountFlowTests(unittest.TestCase):
         self.assertEqual(result.stdout, f"OK\t{mountpoint}\t3.1.1\n")
         self.assertEqual(self.read("mount-argv").splitlines()[:2],
                          ["//photos.example.net/Backups", mountpoint])
-        options = self.read("argv").splitlines()[3].split(",")
+        options = self.read("mount-argv").splitlines()[3].split(",")
         self.assertIn("x-gvfs-name=Backups%20%5BJordan%27s%20NAS%5D", options)
         self.assertIn("x-gvfs-icon=folder-remote", options)
+
+    def test_long_share_name_mounts_under_a_long_folder_request(self):
+        share = "s" * 255
+        result = self.mount("--uid", "1000", "--host", "nas", "--share", share, "--user", "kris",
+                            "--folder", f"{share}@{'d' * 64}")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(result.stdout.startswith(f"OK\t{self.base}/1000/nas/{'s' * 100}\t"))
 
     def test_sidebar_defaults_to_the_folder_name_with_its_suffix(self):
         first = self.mount("--uid", "1000", "--host", "nas", "--share", "Media", "--user", "kris",
                            "--folder", "Media+Nas")
         self.assertEqual(first.returncode, 0, first.stderr)
-        self.assertIn("x-gvfs-name=Media%2BNas", self.read("argv").splitlines()[3].split(","))
+        self.assertIn("x-gvfs-name=Media%2BNas", self.read("mount-argv").splitlines()[3].split(","))
         os.makedirs(os.path.join(self.base, "1000", "nas", "Other+Nas", "taken"))
         second = self.mount("--uid", "1000", "--host", "nas", "--share", "Other", "--user", "kris",
                             "--folder", "Other+Nas")
         self.assertTrue(second.stdout.startswith(f"OK\t{self.base}/1000/nas/Other+Nas~2\t"), second.stderr)
-        self.assertIn("x-gvfs-name=Other%2BNas~2", self.read("argv").splitlines()[3].split(","))
+        self.assertIn("x-gvfs-name=Other%2BNas~2", self.read("mount-argv").splitlines()[3].split(","))
 
     def test_without_a_folder_name_the_folder_is_the_share(self):
         result = self.mount("--uid", "1000", "--host", "nas", "--share", "Media", "--user", "kris")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(result.stdout.startswith(f"OK\t{self.base}/1000/nas/Media\t"))
-        self.assertIn("x-gvfs-name=Media", self.read("argv").splitlines()[3].split(","))
+        self.assertIn("x-gvfs-name=Media", self.read("mount-argv").splitlines()[3].split(","))
+        self.assertFalse(any(o.startswith("x-") for o in self.read("argv").splitlines()[3].split(",")))
 
     def test_share_mounted_under_its_old_folder_name_is_already_mounted(self):
         first = self.mount("--uid", "1000", "--host", "nas", "--share", "Media", "--user", "kris")
@@ -498,7 +523,7 @@ class MountFlowTests(unittest.TestCase):
         self.assertEqual(again.stdout, f"ALREADY\t{self.base}/1000/nas/Media\t3.1.1\n")
 
     def test_invalid_folder_and_sidebar_names_are_refused(self):
-        bad = [("--folder", "x" * 201), ("--folder", "a/b"), ("--folder", "tab\there"),
+        bad = [("--folder", "x" * 1025), ("--folder", "a/b"), ("--folder", "tab\there"),
                ("--sidebar", "x" * 257), ("--sidebar", "nl\nhere")]
         for option, value in bad:
             result = self.mount("--uid", "1000", "--host", "nas", "--share", "Media",
@@ -506,7 +531,7 @@ class MountFlowTests(unittest.TestCase):
             self.assertEqual(result.returncode, 3, (option, value))
             self.assertTrue(result.stderr.startswith("EINVALID\t"), (option, value))
         ok = self.mount("--uid", "1000", "--host", "nas", "--share", "Media", "--user", "kris",
-                        "--folder", "f" * 200, "--sidebar", "a/b " + "s" * 252)
+                        "--folder", "f" * 1024, "--sidebar", "a/b " + "s" * 252)
         self.assertEqual(ok.returncode, 0, ok.stderr)
         self.assertTrue(ok.stdout.startswith(f"OK\t{self.base}/1000/nas/{'f' * 100}\t"))
         dots = self.mount("--uid", "1000", "--host", "other", "--share", "Media", "--user", "kris",

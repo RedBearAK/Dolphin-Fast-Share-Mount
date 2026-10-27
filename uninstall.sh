@@ -250,6 +250,7 @@ uninstall_user() {
     remove_file "$command"
     remove_file "$data/kio/servicemenus/dolphin-fast-share-mount.desktop"
     remove_file "$data/kio/servicemenus/dolphin-fast-share-mount-unmount.desktop"
+    remove_file "$data/kio/servicemenus/dolphin-fast-share-mount-unmount-remote.desktop"
     remove_tree "$own_dir"
     remove_tree "$state/$APP_ID"
     if [[ -n ${XDG_RUNTIME_DIR:-} ]]; then

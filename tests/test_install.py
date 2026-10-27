@@ -81,7 +81,8 @@ class UserPartTests(unittest.TestCase):
     def assert_installed(self):
         self.assertTrue(os.path.isfile(self.command) and not os.path.islink(self.command))
         self.assertEqual(stat.S_IMODE(os.stat(self.command).st_mode), 0o755)
-        for name in ("dolphin-fast-share-mount.desktop", "dolphin-fast-share-mount-unmount.desktop"):
+        for name in ("dolphin-fast-share-mount.desktop", "dolphin-fast-share-mount-unmount.desktop",
+                     "dolphin-fast-share-mount-unmount-remote.desktop"):
             path = os.path.join(self.menus, name)
             self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o755, name)
             parser = configparser.ConfigParser(interpolation=None)
@@ -92,14 +93,19 @@ class UserPartTests(unittest.TestCase):
                     exec_line = parser[section]["Exec"]
                     self.assertTrue(exec_line.startswith(f'"{self.command}" '), exec_line)
                     self.assertIn("--gui", exec_line)
-                    self.assertTrue(exec_line.endswith("%U"))
-            if name.endswith("-unmount.desktop"):
-                # offered everywhere: every file and folder, every protocol, top level
+                    # remote locations get no URLs: KIO would download them first
+                    self.assertEqual(exec_line.endswith("%U"), not name.endswith("-remote.desktop"))
+                    self.assertNotIn("%", exec_line.replace("%U", ""))
+            if "-unmount" in name:
+                # every file and folder, local (file) or any other protocol, top level
                 entry = parser["Desktop Entry"]
                 self.assertIn("all/all", entry["MimeType"].split(";"))
-                self.assertNotIn("X-KDE-Protocols", entry)
                 self.assertNotIn("X-KDE-Submenu", entry)
                 self.assertIn("--choose", parser["Desktop Action unmount"]["Exec"])
+                if name.endswith("-remote.desktop"):
+                    self.assertEqual((entry.get("X-KDE-Protocol"), entry.get("X-KDE-Protocols")), ("!file", None))
+                else:
+                    self.assertEqual((entry.get("X-KDE-Protocol"), entry.get("X-KDE-Protocols")), (None, "file"))
             # both in the main menu, never in Dolphin's Actions submenu
             self.assertEqual(parser["Desktop Entry"]["X-KDE-Priority"], "TopLevel", name)
         self.assertTrue(os.path.isfile(self.config))

@@ -43,7 +43,8 @@ HELPER_CANDIDATES = (
     "/usr/local/libexec/fast-share-mount-helper",
 )
 POLKIT_ACTION = "io.github.redbearak.dolphin-fast-share-mount.mount"
-SERVICE_MENUS = ("dolphin-fast-share-mount.desktop", "dolphin-fast-share-mount-unmount.desktop")
+SERVICE_MENUS = ("dolphin-fast-share-mount.desktop", "dolphin-fast-share-mount-unmount.desktop",
+                 "dolphin-fast-share-mount-unmount-remote.desktop")
 SEARCH_PATH = "/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin"
 LOG_MAX_BYTES = 1024 * 1024
 PROBE_TIMEOUT = 5
@@ -195,13 +196,13 @@ def parse_smb_url(url: str) -> ShareRef:
             raise UsageError(f"Invalid port in the address: {port_text}")
         port = int(port_text)
     segments = [urllib.parse.unquote(s) for s in parts.path.split("/") if s]
+    if not is_valid_host(host):
+        raise UsageError(f"Server name not supported: {host}")
     if not segments:
         raise ServerRoot(
             f"smb://{host}/ is a server or workgroup, not a share. Open one of its shares first.",
             f"smb://{parts.netloc}/", host, port)
     share, subpath = segments[0], tuple(segments[1:])
-    if not is_valid_host(host):
-        raise UsageError(f"Server name not supported: {host}")
     if not is_valid_share(share):
         raise UsageError(f"Share name not supported: {share}")
     if any(s in (".", "..") or "/" in s or "\0" in s for s in subpath):
@@ -260,9 +261,10 @@ def parse_config(text: str) -> tuple:
             continue
         if key == "folder_name":
             value = FOLDER_NAME_ALIASES.get(value, value)
-            if not _FOLDER_TEMPLATE.fullmatch(value) or "{share}" not in value:
+            if not _FOLDER_TEMPLATE.fullmatch(value) or "{share}" not in value or len(value) > 100:
                 warnings.append(
-                    f"line {number}: folder_name '{value}' needs {{share}} and may hold only "
+                    f"line {number}: folder_name '{value}' needs {{share}}, at most 100 "
+                    f"characters, and may hold only "
                     f"{{server_address}}, {{server_display_name}}, {{server_short_name}}, "
                     f"letters, digits and . _ - + @; "
                     f"keeping '{config[key]}'")
@@ -567,6 +569,38 @@ def server_display_name(host: str, timeout: float = 1.0) -> str | None:
     return None
 
 
+def server_names_path() -> str:
+    return os.path.join(state_dir(), "server-names")
+
+
+def read_server_names() -> dict:
+    """host -> announced name, as last seen ("host<TAB>name" lines)."""
+    names = {}
+    try:
+        with open(server_names_path(), encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                host, sep, name = line.rstrip("\n").partition("\t")
+                if sep and is_valid_host(host) and name and name.isprintable() \
+                        and len(name.encode("utf-8")) <= 64:
+                    names[host] = name
+    except OSError:
+        pass
+    return names
+
+
+def write_server_names(names: dict, log) -> None:
+    path = server_names_path()
+    try:
+        os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+        temporary = f"{path}.{os.getpid()}.tmp"
+        with open(temporary, "w", encoding="utf-8") as handle:
+            for host in sorted(names):
+                handle.write(f"{host}\t{names[host]}\n")
+        os.replace(temporary, path)
+    except OSError as error:
+        log.warning(f"could not remember server names in {path}: {error}")
+
+
 def folder_label(host: str, announced: str | None) -> str:
     """The server part of a "Server-Share" folder name: the announced name,
     else the host's first label (an address stays whole). Control characters
@@ -692,7 +726,7 @@ def remote_url(text: str) -> str:
         return text
     result = run(["gdbus", "call", "--session", "--dest", "org.kde.KIOFuse",
                   "--object-path", "/org/kde/KIOFuse",
-                  "--method", "org.kde.KIOFuse.VFS.remoteUrl", path], timeout=10)
+                  "--method", "org.kde.KIOFuse.VFS.remoteUrl", "--", path], timeout=10)
     reply = gvariant_string(result.stdout) if result.returncode == 0 else None
     if not reply:
         detail = result.stderr.strip() or result.stdout.strip()
@@ -887,7 +921,7 @@ class PasswordStore:
             return None
         name, path = service
         result = run(["gdbus", "call", "--session", "--dest", name, "--object-path", path,
-                      "--method", f"org.kde.KWallet.{method}", *args], timeout=120)
+                      "--method", f"org.kde.KWallet.{method}", "--", *args], timeout=120)
         if result.returncode != 0:
             self.log.warning(f"KWallet {method} failed: {result.stderr.strip()}")
             return None
@@ -1119,6 +1153,7 @@ PACKAGES = {
     "secret-tool": {"zypper": "libsecret-tools", "dnf": "libsecret", "apt": "libsecret-tools",
                     "pacman": "libsecret"},
     "kwallet-query": {"zypper": "kwallet-tools"},
+    "gdbus": {"zypper": "glib2-tools", "dnf": "glib2", "apt": "libglib2.0-bin", "pacman": "glib2"},
     "sudo": {"*": "sudo"},
 }
 INSTALL_COMMANDS = {"zypper": "sudo zypper install", "dnf": "sudo dnf install",
@@ -1288,15 +1323,38 @@ class App:
         values = {"share": ref.share, "server_address": ref.host,
                   "server_short_name": host, "server_display_name": host}
         if "{server_display_name}" in folder_template + (sidebar_template or ""):
-            values["server_display_name"] = folder_label(ref.host, server_display_name(ref.host)) or host
+            values["server_display_name"] = folder_label(ref.host, self.display_name(ref.host)) or host
         args = []
         folder = fill_name(folder_template, values)
+        while len(folder.encode("utf-8")) > 1000:  # the helper takes 1024 bytes and keeps 100
+            folder = folder[:-1]
         if folder != ref.share:
             args += ["--folder", folder]
         if sidebar_template is not None:
             text = middle_ellipsis(fill_name(sidebar_template, values).strip())
             args += ["--sidebar", "".join(ch for ch in text if ch.isprintable())]
         return args
+
+    def display_name(self, host: str) -> str | None:
+        """The name HOST announces, asked once per run and remembered between
+        runs, so that a server that is slow to answer (or asleep) keeps the
+        folder name it had."""
+        cache = getattr(self, "_display_names", None)
+        if cache is None:
+            cache = self._display_names = {}
+        if host not in cache:
+            names = read_server_names()
+            announced = server_display_name(host)
+            if announced:
+                announced = folder_label(host, announced)  # printable, at most 64 bytes
+            if announced:
+                if names.get(host) != announced:
+                    names[host] = announced
+                    write_server_names(names, self.log)
+            else:
+                announced = names.get(host)
+            cache[host] = announced
+        return cache[host]
 
     def pick_shares(self, root: "ServerRoot") -> tuple:
         """(smb:// addresses of the shares picked on a server, error status)."""
@@ -1653,6 +1711,11 @@ class App:
         else:
             problems += 1
             row("Dialogs and password prompt", "MISSING", install_hint("kdialog"))
+        if which("gdbus"):
+            row("D-Bus calls (gdbus)", "ok", which("gdbus"))
+        else:
+            problems += 1
+            row("D-Bus calls (gdbus)", "MISSING", install_hint("gdbus") + " (kio-fuse folders, KWallet)")
         store = PasswordStore(self.log)
         row("Saved passwords", "ok" if store.kind else "none",
             {"kwallet": "KWallet", "secret-tool": "libsecret (secret-tool)"}.get(

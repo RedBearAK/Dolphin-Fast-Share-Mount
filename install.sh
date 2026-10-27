@@ -204,7 +204,8 @@ install_user() {
     INSTALLED=()
     install_file "$SOURCE_DIR/bin/fast-share-mount" "$command" 0755
     local menu
-    for menu in dolphin-fast-share-mount.desktop dolphin-fast-share-mount-unmount.desktop; do
+    for menu in dolphin-fast-share-mount.desktop dolphin-fast-share-mount-unmount.desktop \
+            dolphin-fast-share-mount-unmount-remote.desktop; do
         # Service menus in this folder must be executable (KF 5.85 and later).
         install_file "$SOURCE_DIR/servicemenus/$menu" "$data/kio/servicemenus/$menu" 0755 @BIN@ "$command"
     done

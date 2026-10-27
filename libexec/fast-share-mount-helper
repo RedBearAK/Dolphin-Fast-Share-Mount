@@ -3,7 +3,8 @@
 # fast-share-mount-helper
 #
 # Root side of Dolphin-Fast-Share-Mount. Mounts and unmounts CIFS shares at
-# /run/dolphin-fast-share-mount/<uid>/<host>/<share> for one desktop user.
+# /run/dolphin-fast-share-mount/<uid>/<host>/<folder> for one desktop user
+# (<folder>: the share's name, or the name the caller asks for, made safe).
 #
 # It is started by the user-side command fast-share-mount through pkexec
 # (polkit action io.github.redbearak.dolphin-fast-share-mount.mount) or sudo.
@@ -142,11 +143,11 @@ safe_name() {
 }
 
 # A folder name asked for by the caller: printable text without "/", at
-# most 200 bytes (safe_name then makes it a folder name of at most 100).
+# most 1024 bytes (safe_name then makes it a folder name of at most 100).
 is_valid_folder_request() {
     local name=$1
     local LC_ALL=C
-    [[ -n $name && ${#name} -le 200 && $name != */* && $name != *[[:cntrl:]]* ]]
+    [[ -n $name && ${#name} -le 1024 && $name != */* && $name != *[[:cntrl:]]* ]]
 }
 
 # The name for Dolphin's sidebar: printable text, at most 256 bytes.
@@ -264,8 +265,15 @@ classify_mount_error() {
         CLASS_MESSAGE="The server did not answer within ${MOUNT_TIMEOUT} seconds"
         return
     fi
-    if [[ $kernel == *[Dd]"ialect not supported"* || $kernel == *"protocol negotiation failed"* \
-            || $kernel == *"negotiate protocol failed"* || $kernel == *"SMB1"*"disabled"* ]]; then
+    # Only this attempt's lines when they can be told apart (without
+    # journalctl, all of dmesg is read).
+    local text=$kernel
+    attempt_lines "$kernel" "$source"
+    if [[ -n $ATTEMPT_FOUND ]]; then
+        text=$ATTEMPT
+    fi
+    if [[ $text == *[Dd]"ialect not supported"* || $text == *"protocol negotiation failed"* \
+            || $text == *"negotiate protocol failed"* || $text == *"SMB1"*"disabled"* ]]; then
         CLASS_CODE=EDIALECT
         CLASS_MESSAGE="The server and this computer have no SMB version in common"
         return

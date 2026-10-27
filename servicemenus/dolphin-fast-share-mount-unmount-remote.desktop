@@ -1,0 +1,16 @@
+[Desktop Entry]
+Type=Service
+MimeType=all/all;inode/directory;
+X-KDE-Protocol=!file
+X-KDE-Priority=TopLevel
+Actions=unmount;
+
+# No %U here: for a remote location, KIO would download the selected files
+# (or map them through kio-fuse) before starting the command. The list then
+# has nothing ticked in advance.
+[Desktop Action unmount]
+Name=Fast Share Unmount…
+Icon=media-eject
+Exec="@BIN@" unmount --choose --gui
+
+# End of File #
