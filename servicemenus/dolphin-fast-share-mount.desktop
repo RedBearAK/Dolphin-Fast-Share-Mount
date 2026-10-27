@@ -3,6 +3,7 @@ Type=Service
 MimeType=inode/directory;
 X-KDE-Protocols=smb
 X-KDE-Submenu=Fast Share Mount
+X-KDE-Priority=TopLevel
 Actions=mount;mountwindow;
 
 [Desktop Action mount]

@@ -1,6 +1,7 @@
 [Desktop Entry]
 Type=Service
 MimeType=all/all;inode/directory;
+X-KDE-Priority=TopLevel
 Actions=unmount;
 
 [Desktop Action unmount]

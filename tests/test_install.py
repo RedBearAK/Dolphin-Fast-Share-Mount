@@ -100,6 +100,8 @@ class UserPartTests(unittest.TestCase):
                 self.assertNotIn("X-KDE-Protocols", entry)
                 self.assertNotIn("X-KDE-Submenu", entry)
                 self.assertIn("--choose", parser["Desktop Action unmount"]["Exec"])
+            # both in the main menu, never in Dolphin's Actions submenu
+            self.assertEqual(parser["Desktop Entry"]["X-KDE-Priority"], "TopLevel", name)
         self.assertTrue(os.path.isfile(self.config))
         with open(os.path.join(self.own_dir, "installed-files.txt"), encoding="utf-8") as handle:
             listed = handle.read().split()

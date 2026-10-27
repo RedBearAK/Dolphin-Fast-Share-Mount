@@ -26,7 +26,7 @@ Right-click anything, anywhere (a file, a folder or the background, local or rem
 
 Dolphin's sidebar lists each mount under Remote. Its own **Unmount** (in the entry's context menu) does not work and says "must be superuser to unmount": the mount belongs to root, and the system lets a normal user unmount only what fstab allows. Use **Fast Share Unmount…** instead.
 
-When more than a few service menu entries apply, Dolphin moves them all into an **Actions** submenu; the two entries are named so that they sort next to each other there.
+Both entries sit in the main context menu, next to each other (`X-KDE-Priority=TopLevel`), so they never end up in Dolphin's **Actions** submenu, which collects service menu entries once more than four apply. They also do not count towards those four.
 
 Every outcome is a desktop notification, and every failure is also a dialog that names the cause: wrong password, an account or share the server refuses, share not found, server not reachable, a missing component with the command that installs it, or a dismissed authorisation request.
 
