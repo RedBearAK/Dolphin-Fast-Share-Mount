@@ -477,7 +477,9 @@ ensure_user_root() {
 remove_if_empty() {
     local path
     for path in "$@"; do
-        [[ -d $path && ! -L $path ]] && rmdir -- "$path" 2>/dev/null || true
+        if [[ -d $path && ! -L $path ]]; then
+            rmdir -- "$path" 2>/dev/null || true
+        fi
     done
 }
 
