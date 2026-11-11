@@ -203,6 +203,18 @@ runs `bash -n`, `shellcheck` (when installed) and the unit tests (Python `unitte
 
 `tests/integration/samba-test.sh` mounts real shares from a Samba container (podman or docker) and needs `cifs-utils` and sudo. It touches only its own mounts (below `/run/dolphin-fast-share-mount/<uid>/127.0.0.1`), so shares you have mounted with the tool stay mounted; its `unmount-all` check is skipped while you have any. GitHub Actions runs both.
 
+## Sponsor / Donate
+
+A small tool like this still takes real time to get right: the mount has to be safe to run as root from a file manager, work the same on Plasma 5 and 6, and never leave anything behind after a reboot. If Fast Share Mount made your network shares faster or easier to use, and you would like me to keep maintaining and improving it, you can throw some money at me through one of these platforms:
+
+<a href="https://www.buymeacoffee.com/RedBearAK"><img src="https://img.buymeacoffee.com/button-api/?text=Buy me a coffee&emoji=&slug=RedBearAK&button_colour=865e3c&font_colour=ffffff&font_family=Bree&outline_colour=ffffff&coffee_colour=FFDD00" /></a>
+
+https://buymeacoffee.com/RedBearAK
+
+[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/G2G34VVZW)
+
+https://ko-fi.com/RedBearAK
+
 ## Licence
 
 GPL-3.0-or-later. See [LICENSE](LICENSE).
